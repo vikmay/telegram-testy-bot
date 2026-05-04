@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Secrets
+token.txt
+.env
+.env.*
+
+# Local data/state
+data/students.json
+data/state.json
+data/*.db
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.sixth/
