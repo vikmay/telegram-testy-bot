@@ -75,6 +75,8 @@ class StudentState:
     selected_topic_ids: List[str] = field(default_factory=list)
     topic_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pending_multi_answers: List[int] = field(default_factory=list)
+    matching_pairs: Dict[int, int] = field(default_factory=dict)
+    matching_selected_left: Optional[int] = None
     current_test_topic_id: Optional[str] = None
     current_test_score: int = 0
     current_test_started_at: Optional[float] = None
@@ -210,6 +212,8 @@ class SessionStore:
                     current_question_id TEXT,
                     current_question_message_id INTEGER,
                     pending_multi_answers TEXT NOT NULL DEFAULT '[]',
+                    matching_pairs TEXT NOT NULL DEFAULT '{}',
+                    matching_selected_left INTEGER,
                     current_test_topic_id TEXT,
                     current_test_score INTEGER NOT NULL DEFAULT 0,
                     current_test_started_at REAL,
@@ -231,6 +235,24 @@ class SessionStore:
                 """
             )
             conn.commit()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(student_sessions)").fetchall()}
+            migrations = [
+                ("matching_pairs", "ALTER TABLE student_sessions ADD COLUMN matching_pairs TEXT NOT NULL DEFAULT '{}'"),
+                ("matching_selected_left", "ALTER TABLE student_sessions ADD COLUMN matching_selected_left INTEGER"),
+                ("awaiting_docx_import", "ALTER TABLE student_sessions ADD COLUMN awaiting_docx_import INTEGER NOT NULL DEFAULT 0"),
+                ("awaiting_docx_topic_id", "ALTER TABLE student_sessions ADD COLUMN awaiting_docx_topic_id TEXT"),
+                ("awaiting_topic_action", "ALTER TABLE student_sessions ADD COLUMN awaiting_topic_action INTEGER NOT NULL DEFAULT 0"),
+                ("topic_action_mode", "ALTER TABLE student_sessions ADD COLUMN topic_action_mode TEXT"),
+                ("topic_action_source", "ALTER TABLE student_sessions ADD COLUMN topic_action_source TEXT"),
+                ("awaiting_delete_action", "ALTER TABLE student_sessions ADD COLUMN awaiting_delete_action INTEGER NOT NULL DEFAULT 0"),
+                ("delete_action_mode", "ALTER TABLE student_sessions ADD COLUMN delete_action_mode TEXT"),
+                ("delete_action_source", "ALTER TABLE student_sessions ADD COLUMN delete_action_source TEXT"),
+                ("updated_at", "ALTER TABLE student_sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            ]
+            for column, sql in migrations:
+                if column not in cols:
+                    conn.execute(sql)
+            conn.commit()
 
     @staticmethod
     def _dumps(value) -> str:
@@ -250,7 +272,7 @@ class SessionStore:
             cursor = conn.execute(
                 """
                 SELECT user_id, chat_id, current_test, current_index, current_question_id, current_question_message_id,
-                       pending_multi_answers, current_test_topic_id, current_test_score, current_test_started_at,
+                       pending_multi_answers, matching_pairs, matching_selected_left, current_test_topic_id, current_test_score, current_test_started_at,
                        current_test_duration_seconds, selected_topic_ids, topic_stats, awaiting_name, awaiting_question,
                        awaiting_docx_import, awaiting_docx_topic_id, awaiting_topic_action, topic_action_mode,
                        topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source
@@ -267,22 +289,28 @@ class SessionStore:
                     "current_question_id": row[4],
                     "current_question_message_id": row[5],
                     "pending_multi_answers": self._loads(row[6], []),
-                    "current_test_topic_id": row[7],
-                    "current_test_score": row[8],
-                    "current_test_started_at": row[9],
-                    "current_test_duration_seconds": row[10],
-                    "selected_topic_ids": self._loads(row[11], []),
-                    "topic_stats": self._loads(row[12], {}),
-                    "awaiting_name": bool(row[13]),
-                    "awaiting_question": bool(row[14]),
-                    "awaiting_docx_import": bool(row[15]),
-                    "awaiting_docx_topic_id": row[16],
-                    "awaiting_topic_action": bool(row[17]),
-                    "topic_action_mode": row[18],
-                    "topic_action_source": row[19],
-                    "awaiting_delete_action": bool(row[20]),
-                    "delete_action_mode": row[21],
-                    "delete_action_source": row[22],
+                    "matching_pairs": {
+                        int(left): int(right)
+                        for left, right in (self._loads(row[7], {}) or {}).items()
+                        if str(left).lstrip("-").isdigit() and str(right).lstrip("-").isdigit()
+                    },
+                    "matching_selected_left": row[8],
+                    "current_test_topic_id": row[9],
+                    "current_test_score": row[10],
+                    "current_test_started_at": row[11],
+                    "current_test_duration_seconds": row[12],
+                    "selected_topic_ids": self._loads(row[13], []),
+                    "topic_stats": self._loads(row[14], {}),
+                    "awaiting_name": bool(row[15]),
+                    "awaiting_question": bool(row[16]),
+                    "awaiting_docx_import": bool(row[17]),
+                    "awaiting_docx_topic_id": row[18],
+                    "awaiting_topic_action": bool(row[19]),
+                    "topic_action_mode": row[20],
+                    "topic_action_source": row[21],
+                    "awaiting_delete_action": bool(row[22]),
+                    "delete_action_mode": row[23],
+                    "delete_action_source": row[24],
                 }
             return rows
 
@@ -295,6 +323,8 @@ class SessionStore:
             "current_question_id": state.current_question_id,
             "current_question_message_id": state.current_question_message_id,
             "pending_multi_answers": self._dumps(state.pending_multi_answers),
+            "matching_pairs": self._dumps(state.matching_pairs),
+            "matching_selected_left": state.matching_selected_left,
             "current_test_topic_id": state.current_test_topic_id,
             "current_test_score": state.current_test_score,
             "current_test_started_at": state.current_test_started_at,
@@ -317,13 +347,13 @@ class SessionStore:
                 """
                 INSERT INTO student_sessions (
                     user_id, chat_id, current_test, current_index, current_question_id, current_question_message_id,
-                    pending_multi_answers, current_test_topic_id, current_test_score, current_test_started_at,
+                    pending_multi_answers, matching_pairs, matching_selected_left, current_test_topic_id, current_test_score, current_test_started_at,
                     current_test_duration_seconds, selected_topic_ids, topic_stats, awaiting_name, awaiting_question,
                     awaiting_docx_import, awaiting_docx_topic_id, awaiting_topic_action, topic_action_mode,
                     topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source, updated_at
                 ) VALUES (
                     :user_id, :chat_id, :current_test, :current_index, :current_question_id, :current_question_message_id,
-                    :pending_multi_answers, :current_test_topic_id, :current_test_score, :current_test_started_at,
+                    :pending_multi_answers, :matching_pairs, :matching_selected_left, :current_test_topic_id, :current_test_score, :current_test_started_at,
                     :current_test_duration_seconds, :selected_topic_ids, :topic_stats, :awaiting_name, :awaiting_question,
                     :awaiting_docx_import, :awaiting_docx_topic_id, :awaiting_topic_action, :topic_action_mode,
                     :topic_action_source, :awaiting_delete_action, :delete_action_mode, :delete_action_source, CURRENT_TIMESTAMP
@@ -335,6 +365,8 @@ class SessionStore:
                     current_question_id=excluded.current_question_id,
                     current_question_message_id=excluded.current_question_message_id,
                     pending_multi_answers=excluded.pending_multi_answers,
+                    matching_pairs=excluded.matching_pairs,
+                    matching_selected_left=excluded.matching_selected_left,
                     current_test_topic_id=excluded.current_test_topic_id,
                     current_test_score=excluded.current_test_score,
                     current_test_started_at=excluded.current_test_started_at,
@@ -856,6 +888,12 @@ class QuizBot:
             student.current_question_id = session.get("current_question_id")
             student.current_question_message_id = session.get("current_question_message_id")
             student.pending_multi_answers = session.get("pending_multi_answers", [])
+            student.matching_pairs = {
+                int(left): int(right)
+                for left, right in (session.get("matching_pairs", {}) or {}).items()
+                if str(left).lstrip("-").isdigit() and str(right).lstrip("-").isdigit()
+            }
+            student.matching_selected_left = session.get("matching_selected_left")
             student.current_test_topic_id = session.get("current_test_topic_id")
             student.current_test_score = session.get("current_test_score", 0)
             student.current_test_started_at = session.get("current_test_started_at")
@@ -874,6 +912,12 @@ class QuizBot:
             student.delete_action_source = session.get("delete_action_source", student.delete_action_source)
         for student in self.students.values():
             student.selected_topic_ids = self._normalize_topic_ids(student.selected_topic_ids or [])
+            student.matching_pairs = {
+                int(left): int(right)
+                for left, right in (student.matching_pairs or {}).items()
+                if isinstance(left, int) or str(left).lstrip("-").isdigit()
+            }
+            student.matching_selected_left = int(student.matching_selected_left) if student.matching_selected_left is not None and str(student.matching_selected_left).lstrip("-").isdigit() else None
             student.topic_stats = {topic_id: {"correct": 0, "total": 0} for topic_id in student.selected_topic_ids} if not student.topic_stats else student.topic_stats
             student.current_test_duration_seconds = student.current_test_duration_seconds or self.test_duration_seconds
             if student.user_id in self.admin_user_ids and student.status in {"new", "awaiting_name", "pending_approval"}:
@@ -920,14 +964,28 @@ class QuizBot:
             available = self._available_questions(topic_ids)
         return random.choice(available) if available else None
 
-    def _build_keyboard(self, options: List[str], question_type: str = "single", selected_indexes: Optional[Set[int]] = None):
+    def _build_keyboard(self, options: List[str], question_type: str = "single", selected_indexes: Optional[Set[int]] = None, matching_pairs: Optional[Dict[int, int]] = None, matching_selected_left: Optional[int] = None):
         keyboard = []
         selected_indexes = selected_indexes or set()
+        matching_pairs = matching_pairs or {}
         if question_type == "matching":
-            for index, option in enumerate(options, start=1):
-                letter = chr(ord("a") + index - 1)
-                label = f"{index}{letter}. {option}"
-                keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
+            half = len(options) // 2
+            left_options = options[:half] if half else options
+            right_options = options[half:] if half else []
+            row_count = max(len(left_options), len(right_options))
+            for index in range(row_count):
+                row = []
+                if index < len(left_options):
+                    left_is_marked = matching_selected_left == index or index in matching_pairs
+                    left_label = f"{'✅ ' if left_is_marked else ''}{index + 1}. {left_options[index]}"
+                    row.append({"text": left_label, "callback_data": f"answer:left:{index}"})
+                if index < len(right_options):
+                    chosen_left = next((left_index for left_index, chosen_right in matching_pairs.items() if chosen_right == index), None)
+                    right_label = f"{'✅ ' if chosen_left is not None else ''}{chr(ord('a') + index)}. {right_options[index]}"
+                    row.append({"text": right_label, "callback_data": f"answer:right:{index}"})
+                keyboard.append(row)
+            keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
+            keyboard.append([{"text": "🧹 Скинути", "callback_data": "answer:reset"}])
             return {"inline_keyboard": keyboard}
         if question_type == "multi":
             for index, option in enumerate(options, start=1):
@@ -1153,6 +1211,8 @@ class QuizBot:
         student.current_test_score = 0
         student.current_test_started_at = None
         student.current_test_duration_seconds = None
+        student.matching_pairs = {}
+        student.matching_selected_left = None
         self._persist_students()
         self.api.send_message(student.chat_id, "⏰ Час тесту вийшов. Тест завершено.", reply_markup=self._build_post_test_keyboard())
 
@@ -1345,6 +1405,8 @@ class QuizBot:
         student.awaiting_delete_action = False
         student.delete_action_mode = None
         student.delete_action_source = None
+        student.matching_pairs = {}
+        student.matching_selected_left = None
         topic_ids = [topic_id] if topic_id else student.selected_topic_ids or [DEFAULT_TEST_TOPIC_NAME]
         available = self._available_questions(topic_ids)
         if not available:
@@ -1391,10 +1453,27 @@ class QuizBot:
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
             right_options = question.options[half:] if half else []
-            block_lines = [f"{i + 1}. {opt}" for i, opt in enumerate(left_options)]
+            block_lines = ["Ліва колонка:"]
+            block_lines.extend([f"{i + 1}. {opt}" for i, opt in enumerate(left_options)])
+            block_lines.append("")
+            block_lines.append("Права колонка:")
             block_lines.extend([f"{chr(ord('a') + i)}. {opt}" for i, opt in enumerate(right_options)])
-            text += "\n\nЗістав пари:\n\n" + "\n".join(block_lines) + "\n\nВідповідь пиши так: 1a, 2b, 3c"
-            self.api.send_message(student.chat_id, text)
+            text += "\n\nЗістав пари: натискай спочатку лівий номер, потім праву букву. Пару можна змінювати до підтвердження.\n\n" + "\n".join(block_lines)
+            student.matching_pairs = {}
+            student.matching_selected_left = None
+            sent_message = self.api.send_message(
+                student.chat_id,
+                text,
+                reply_markup=self._build_keyboard(
+                    question.options,
+                    question_type="matching",
+                    matching_pairs=student.matching_pairs,
+                    matching_selected_left=student.matching_selected_left,
+                ),
+            )
+            if isinstance(sent_message, dict) and "message_id" in sent_message:
+                student.current_question_message_id = sent_message["message_id"]
+                self._persist_students()
             return
         if question.type == "multi":
             text += "\n\nВибрано: нічого"
@@ -1827,7 +1906,153 @@ class QuizBot:
             if not question:
                 self.api.answer_callback_query(callback_query["id"], "Питання не знайдено")
                 return
+
             raw = data.split(":", 1)[1]
+            if question.type == "matching":
+                left_count = len(question.options) // 2 if len(question.options) // 2 else len(question.options)
+                if left_count > 0 and len(student.matching_pairs) >= left_count and raw not in {"submit", "reset"}:
+                    self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
+                    return
+            if question.type == "matching":
+                if raw == "submit":
+                    pairs = [(left + 1, right + 1) for left, right in sorted(student.matching_pairs.items())]
+                    self._grade_matching_question(student, pairs)
+                    student.matching_pairs = {}
+                    student.matching_selected_left = None
+                    self._persist_students()
+                    self.api.answer_callback_query(callback_query["id"], "Відповідь отримано")
+                    return
+
+                if raw == "reset":
+                    student.matching_pairs = {}
+                    student.matching_selected_left = None
+                    self._persist_students()
+                    self.api.edit_message_text(
+                        chat_id,
+                        message["message_id"],
+                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nСтан зіставлення скинуто.",
+                        reply_markup=self._build_keyboard(
+                            question.options,
+                            question_type="matching",
+                            matching_pairs=student.matching_pairs,
+                            matching_selected_left=student.matching_selected_left,
+                        ),
+                    )
+                    self.api.answer_callback_query(callback_query["id"], "Скинуто")
+                    return
+
+                parts = data.split(":")
+                if len(parts) != 3:
+                    self.api.answer_callback_query(callback_query["id"], "Невідома кнопка")
+                    return
+
+                side, raw_index = parts[1], parts[2]
+                try:
+                    index = int(raw_index)
+                except ValueError:
+                    self.api.answer_callback_query(callback_query["id"], "Невідома кнопка")
+                    return
+
+                half = len(question.options) // 2
+                left_count = half if half else len(question.options)
+                right_count = len(question.options) - left_count
+
+                if side == "left":
+                    if index < 0 or index >= left_count:
+                        self.api.answer_callback_query(callback_query["id"], "Невірний номер")
+                        return
+                    if left_count > 0 and len(student.matching_pairs) >= left_count:
+                        self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
+                        return
+                    if student.matching_selected_left == index:
+                        student.matching_selected_left = None
+                        self._persist_students()
+                        self.api.edit_message_text(
+                            chat_id,
+                            message["message_id"],
+                            f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}",
+                            reply_markup=self._build_keyboard(
+                                question.options,
+                                question_type="matching",
+                                matching_pairs=student.matching_pairs,
+                                matching_selected_left=student.matching_selected_left,
+                            ),
+                        )
+                        self.api.answer_callback_query(callback_query["id"], "Знято вибір")
+                        return
+
+                    student.matching_selected_left = index
+                    self._persist_students()
+                    self.api.edit_message_text(
+                        chat_id,
+                        message["message_id"],
+                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОберіть праву букву для {index + 1}.",
+                        reply_markup=self._build_keyboard(
+                            question.options,
+                            question_type="matching",
+                            matching_pairs=student.matching_pairs,
+                            matching_selected_left=student.matching_selected_left,
+                        ),
+                    )
+                    self.api.answer_callback_query(callback_query["id"], f"Обрано {index + 1}")
+                    return
+
+                if side == "right":
+                    if index < 0 or index >= right_count:
+                        self.api.answer_callback_query(callback_query["id"], "Невірна літера")
+                        return
+                    if left_count > 0 and len(student.matching_pairs) >= left_count:
+                        self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
+                        return
+
+                    chosen_left = next((left_index for left_index, chosen_right in student.matching_pairs.items() if chosen_right == index), None)
+                    if student.matching_selected_left is None:
+                        if len(student.matching_pairs) >= left_count and left_count > 0:
+                            self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
+                        else:
+                            self.api.answer_callback_query(callback_query["id"], "Спочатку обери номер зліва")
+                        return
+
+                    current_left = student.matching_selected_left
+
+                    if current_left in student.matching_pairs and student.matching_pairs[current_left] == index:
+                        self.api.answer_callback_query(callback_query["id"], "Ця пара вже зафіксована")
+                        return
+
+                    if chosen_left is not None:
+                        self.api.answer_callback_query(callback_query["id"], "Ця літера вже використана. Натисни «Скинути», щоб змінити.")
+                        return
+                    if len(student.matching_pairs) >= left_count and left_count > 0:
+                        self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
+                        return
+
+                    student.matching_pairs[current_left] = index
+                    student.matching_selected_left = None
+                    self._persist_students()
+
+                    all_paired = len(student.matching_pairs) >= left_count and left_count > 0
+                    pairs_text = ", ".join(f"{left + 1}{chr(ord('a') + right)}" for left, right in sorted(student.matching_pairs.items())) or "нічого"
+                    question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nПари: {pairs_text}"
+                    if all_paired:
+                        question_text += "\n\n✅ Усі пари відмічено. Тепер доступне лише підтвердження або скидання."
+
+                    self.api.edit_message_text(
+                        chat_id,
+                        message["message_id"],
+                        question_text,
+                        reply_markup=self._build_keyboard(
+                            question.options,
+                            question_type="matching",
+                            matching_pairs=student.matching_pairs,
+                            matching_selected_left=student.matching_selected_left,
+                        ),
+                    )
+                    self.api.answer_callback_query(callback_query["id"], f"Пара: {pairs_text}")
+                    return
+
+                self.api.answer_callback_query(callback_query["id"], "Невідома кнопка")
+                return
+
             if raw == "submit":
                 if question.type == "multi":
                     self._grade_question(student, set(student.pending_multi_answers))
@@ -1835,6 +2060,7 @@ class QuizBot:
                     self._persist_students()
                 self.api.answer_callback_query(callback_query["id"], "Відповідь отримано")
                 return
+
             try:
                 selected = int(raw)
             except ValueError:
