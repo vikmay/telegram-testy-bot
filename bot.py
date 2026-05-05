@@ -77,6 +77,9 @@ class StudentState:
     pending_multi_answers: List[int] = field(default_factory=list)
     matching_pairs: Dict[int, int] = field(default_factory=dict)
     matching_selected_left: Optional[int] = None
+    shuffled_options: List[int] = field(default_factory=list)
+    shuffled_matching_left: List[int] = field(default_factory=list)
+    shuffled_matching_right: List[int] = field(default_factory=list)
     current_test_topic_id: Optional[str] = None
     current_test_score: int = 0
     current_test_started_at: Optional[float] = None
@@ -214,6 +217,9 @@ class SessionStore:
                     pending_multi_answers TEXT NOT NULL DEFAULT '[]',
                     matching_pairs TEXT NOT NULL DEFAULT '{}',
                     matching_selected_left INTEGER,
+                    shuffled_options TEXT NOT NULL DEFAULT '[]',
+                    shuffled_matching_left TEXT NOT NULL DEFAULT '[]',
+                    shuffled_matching_right TEXT NOT NULL DEFAULT '[]',
                     current_test_topic_id TEXT,
                     current_test_score INTEGER NOT NULL DEFAULT 0,
                     current_test_started_at REAL,
@@ -239,6 +245,9 @@ class SessionStore:
             migrations = [
                 ("matching_pairs", "ALTER TABLE student_sessions ADD COLUMN matching_pairs TEXT NOT NULL DEFAULT '{}'"),
                 ("matching_selected_left", "ALTER TABLE student_sessions ADD COLUMN matching_selected_left INTEGER"),
+                ("shuffled_options", "ALTER TABLE student_sessions ADD COLUMN shuffled_options TEXT NOT NULL DEFAULT '[]'"),
+                ("shuffled_matching_left", "ALTER TABLE student_sessions ADD COLUMN shuffled_matching_left TEXT NOT NULL DEFAULT '[]'"),
+                ("shuffled_matching_right", "ALTER TABLE student_sessions ADD COLUMN shuffled_matching_right TEXT NOT NULL DEFAULT '[]'"),
                 ("awaiting_docx_import", "ALTER TABLE student_sessions ADD COLUMN awaiting_docx_import INTEGER NOT NULL DEFAULT 0"),
                 ("awaiting_docx_topic_id", "ALTER TABLE student_sessions ADD COLUMN awaiting_docx_topic_id TEXT"),
                 ("awaiting_topic_action", "ALTER TABLE student_sessions ADD COLUMN awaiting_topic_action INTEGER NOT NULL DEFAULT 0"),
@@ -272,7 +281,7 @@ class SessionStore:
             cursor = conn.execute(
                 """
                 SELECT user_id, chat_id, current_test, current_index, current_question_id, current_question_message_id,
-                       pending_multi_answers, matching_pairs, matching_selected_left, current_test_topic_id, current_test_score, current_test_started_at,
+                       pending_multi_answers, matching_pairs, matching_selected_left, shuffled_options, shuffled_matching_left, shuffled_matching_right, current_test_topic_id, current_test_score, current_test_started_at,
                        current_test_duration_seconds, selected_topic_ids, topic_stats, awaiting_name, awaiting_question,
                        awaiting_docx_import, awaiting_docx_topic_id, awaiting_topic_action, topic_action_mode,
                        topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source
@@ -295,22 +304,25 @@ class SessionStore:
                         if str(left).lstrip("-").isdigit() and str(right).lstrip("-").isdigit()
                     },
                     "matching_selected_left": row[8],
-                    "current_test_topic_id": row[9],
-                    "current_test_score": row[10],
-                    "current_test_started_at": row[11],
-                    "current_test_duration_seconds": row[12],
-                    "selected_topic_ids": self._loads(row[13], []),
-                    "topic_stats": self._loads(row[14], {}),
-                    "awaiting_name": bool(row[15]),
-                    "awaiting_question": bool(row[16]),
-                    "awaiting_docx_import": bool(row[17]),
-                    "awaiting_docx_topic_id": row[18],
-                    "awaiting_topic_action": bool(row[19]),
-                    "topic_action_mode": row[20],
-                    "topic_action_source": row[21],
-                    "awaiting_delete_action": bool(row[22]),
-                    "delete_action_mode": row[23],
-                    "delete_action_source": row[24],
+                    "shuffled_options": self._loads(row[9], []),
+                    "shuffled_matching_left": self._loads(row[10], []),
+                    "shuffled_matching_right": self._loads(row[11], []),
+                    "current_test_topic_id": row[12],
+                    "current_test_score": row[13],
+                    "current_test_started_at": row[14],
+                    "current_test_duration_seconds": row[15],
+                    "selected_topic_ids": self._loads(row[16], []),
+                    "topic_stats": self._loads(row[17], {}),
+                    "awaiting_name": bool(row[18]),
+                    "awaiting_question": bool(row[19]),
+                    "awaiting_docx_import": bool(row[20]),
+                    "awaiting_docx_topic_id": row[21],
+                    "awaiting_topic_action": bool(row[22]),
+                    "topic_action_mode": row[23],
+                    "topic_action_source": row[24],
+                    "awaiting_delete_action": bool(row[25]),
+                    "delete_action_mode": row[26],
+                    "delete_action_source": row[27],
                 }
             return rows
 
@@ -325,6 +337,9 @@ class SessionStore:
             "pending_multi_answers": self._dumps(state.pending_multi_answers),
             "matching_pairs": self._dumps(state.matching_pairs),
             "matching_selected_left": state.matching_selected_left,
+            "shuffled_options": self._dumps(state.shuffled_options),
+            "shuffled_matching_left": self._dumps(state.shuffled_matching_left),
+            "shuffled_matching_right": self._dumps(state.shuffled_matching_right),
             "current_test_topic_id": state.current_test_topic_id,
             "current_test_score": state.current_test_score,
             "current_test_started_at": state.current_test_started_at,
@@ -367,6 +382,9 @@ class SessionStore:
                     pending_multi_answers=excluded.pending_multi_answers,
                     matching_pairs=excluded.matching_pairs,
                     matching_selected_left=excluded.matching_selected_left,
+                    shuffled_options=excluded.shuffled_options,
+                    shuffled_matching_left=excluded.shuffled_matching_left,
+                    shuffled_matching_right=excluded.shuffled_matching_right,
                     current_test_topic_id=excluded.current_test_topic_id,
                     current_test_score=excluded.current_test_score,
                     current_test_started_at=excluded.current_test_started_at,
@@ -894,6 +912,9 @@ class QuizBot:
                 if str(left).lstrip("-").isdigit() and str(right).lstrip("-").isdigit()
             }
             student.matching_selected_left = session.get("matching_selected_left")
+            student.shuffled_options = session.get("shuffled_options", [])
+            student.shuffled_matching_left = session.get("shuffled_matching_left", [])
+            student.shuffled_matching_right = session.get("shuffled_matching_right", [])
             student.current_test_topic_id = session.get("current_test_topic_id")
             student.current_test_score = session.get("current_test_score", 0)
             student.current_test_started_at = session.get("current_test_started_at")
@@ -918,6 +939,9 @@ class QuizBot:
                 if isinstance(left, int) or str(left).lstrip("-").isdigit()
             }
             student.matching_selected_left = int(student.matching_selected_left) if student.matching_selected_left is not None and str(student.matching_selected_left).lstrip("-").isdigit() else None
+            student.shuffled_options = [int(index) for index in student.shuffled_options if isinstance(index, int) or str(index).isdigit()]
+            student.shuffled_matching_left = [int(index) for index in student.shuffled_matching_left if isinstance(index, int) or str(index).isdigit()]
+            student.shuffled_matching_right = [int(index) for index in student.shuffled_matching_right if isinstance(index, int) or str(index).isdigit()]
             student.topic_stats = {topic_id: {"correct": 0, "total": 0} for topic_id in student.selected_topic_ids} if not student.topic_stats else student.topic_stats
             student.current_test_duration_seconds = student.current_test_duration_seconds or self.test_duration_seconds
             if student.user_id in self.admin_user_ids and student.status in {"new", "awaiting_name", "pending_approval"}:
@@ -964,24 +988,40 @@ class QuizBot:
             available = self._available_questions(topic_ids)
         return random.choice(available) if available else None
 
-    def _build_keyboard(self, options: List[str], question_type: str = "single", selected_indexes: Optional[Set[int]] = None, matching_pairs: Optional[Dict[int, int]] = None, matching_selected_left: Optional[int] = None):
+    def _build_keyboard(
+        self,
+        options: List[str],
+        question_type: str = "single",
+        selected_indexes: Optional[Set[int]] = None,
+        matching_pairs: Optional[Dict[int, int]] = None,
+        matching_selected_left: Optional[int] = None,
+        matching_left_map: Optional[List[int]] = None,
+        matching_right_map: Optional[List[int]] = None,
+    ):
         keyboard = []
         selected_indexes = selected_indexes or set()
         matching_pairs = matching_pairs or {}
+        matching_left_map = matching_left_map or list(range(len(options) // 2 if question_type == "matching" else len(options)))
+        matching_right_map = matching_right_map or list(range(len(options) - len(matching_left_map))) if question_type == "matching" else []
+
+        def trim_label(text: str, max_length: int = 32) -> str:
+            cleaned = re.sub(r"\s+", " ", str(text)).strip()
+            return cleaned if len(cleaned) <= max_length else cleaned[: max_length - 1].rstrip() + "…"
+
         if question_type == "matching":
             half = len(options) // 2
-            left_options = options[:half] if half else options
-            right_options = options[half:] if half else []
+            left_options = [re.sub(r"^\s*[\.\-•]+\s*", "", str(option).strip()) for option in (options[:half] if half else options)]
+            right_options = [re.sub(r"^\s*[\.\-•]+\s*", "", str(option).strip()) for option in (options[half:] if half else [])]
             row_count = max(len(left_options), len(right_options))
             for index in range(row_count):
                 row = []
                 if index < len(left_options):
-                    left_is_marked = matching_selected_left == index or index in matching_pairs
-                    left_label = f"{'✅ ' if left_is_marked else ''}{index + 1}. {left_options[index]}"
+                    left_mark = "✅ " if index in matching_pairs else ("👉 " if matching_selected_left == index else "")
+                    left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 22)}"
                     row.append({"text": left_label, "callback_data": f"answer:left:{index}"})
                 if index < len(right_options):
-                    chosen_left = next((left_index for left_index, chosen_right in matching_pairs.items() if chosen_right == index), None)
-                    right_label = f"{'✅ ' if chosen_left is not None else ''}{chr(ord('a') + index)}. {right_options[index]}"
+                    right_mark = "✅ " if index in matching_pairs.values() else ""
+                    right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 22)}"
                     row.append({"text": right_label, "callback_data": f"answer:right:{index}"})
                 keyboard.append(row)
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
@@ -989,12 +1029,14 @@ class QuizBot:
             return {"inline_keyboard": keyboard}
         if question_type == "multi":
             for index, option in enumerate(options, start=1):
-                label = f"{'✅ ' if (index - 1) in selected_indexes else ''}{index}. {option}"
+                label = f"{index}. {trim_label(option, 34)}"
+                if (index - 1) in selected_indexes:
+                    label = f"✅ {label}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
         else:
             for index, option in enumerate(options, start=1):
-                label = f"{index}. {option}"
+                label = f"{index}. {trim_label(option, 34)}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
         return {"inline_keyboard": keyboard}
 
@@ -1213,6 +1255,9 @@ class QuizBot:
         student.current_test_duration_seconds = None
         student.matching_pairs = {}
         student.matching_selected_left = None
+        student.shuffled_options = []
+        student.shuffled_matching_left = []
+        student.shuffled_matching_right = []
         self._persist_students()
         self.api.send_message(student.chat_id, "⏰ Час тесту вийшов. Тест завершено.", reply_markup=self._build_post_test_keyboard())
 
@@ -1453,11 +1498,15 @@ class QuizBot:
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
             right_options = question.options[half:] if half else []
+            student.shuffled_matching_left = random.sample(list(range(len(left_options))), len(left_options)) if left_options else []
+            student.shuffled_matching_right = random.sample(list(range(len(right_options))), len(right_options)) if right_options else []
+            shuffled_left_options = [left_options[index] for index in student.shuffled_matching_left] if left_options else []
+            shuffled_right_options = [right_options[index] for index in student.shuffled_matching_right] if right_options else []
             block_lines = ["Ліва колонка:"]
-            block_lines.extend([f"{i + 1}. {opt}" for i, opt in enumerate(left_options)])
+            block_lines.extend([f"{i + 1}. {opt}" for i, opt in enumerate(shuffled_left_options)])
             block_lines.append("")
             block_lines.append("Права колонка:")
-            block_lines.extend([f"{chr(ord('a') + i)}. {opt}" for i, opt in enumerate(right_options)])
+            block_lines.extend([f"{chr(ord('a') + i)}. {opt}" for i, opt in enumerate(shuffled_right_options)])
             text += "\n\nЗістав пари: натискай спочатку лівий номер, потім праву букву. Пару можна змінювати до підтвердження.\n\n" + "\n".join(block_lines)
             student.matching_pairs = {}
             student.matching_selected_left = None
@@ -1465,7 +1514,7 @@ class QuizBot:
                 student.chat_id,
                 text,
                 reply_markup=self._build_keyboard(
-                    question.options,
+                    shuffled_left_options + shuffled_right_options,
                     question_type="matching",
                     matching_pairs=student.matching_pairs,
                     matching_selected_left=student.matching_selected_left,
@@ -1476,8 +1525,14 @@ class QuizBot:
                 self._persist_students()
             return
         if question.type == "multi":
+            student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
+            shuffled_options = [question.options[index] for index in student.shuffled_options]
             text += "\n\nВибрано: нічого"
-        sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(question.options, question_type=question.type, selected_indexes=set(student.pending_multi_answers) if question.type == "multi" else None))
+            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
+        else:
+            student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
+            shuffled_options = [question.options[index] for index in student.shuffled_options]
+            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes=None))
         if isinstance(sent_message, dict) and "message_id" in sent_message:
             student.current_question_message_id = sent_message["message_id"]
             self._persist_students()
@@ -1561,6 +1616,12 @@ class QuizBot:
 
     def _advance_after_answer(self, student: StudentState, question: Question):
         student.current_index += 1
+        student.pending_multi_answers = []
+        student.matching_pairs = {}
+        student.matching_selected_left = None
+        student.shuffled_options = []
+        student.shuffled_matching_left = []
+        student.shuffled_matching_right = []
         if student.current_index >= len(student.current_test):
             topic_id = student.current_test_topic_id or question.topic_id
             attempts = self.results_store.next_attempt_number(student.user_id, topic_id)
@@ -1956,6 +2017,8 @@ class QuizBot:
                 half = len(question.options) // 2
                 left_count = half if half else len(question.options)
                 right_count = len(question.options) - left_count
+                left_map = student.shuffled_matching_left if student.shuffled_matching_left else list(range(left_count))
+                right_map = student.shuffled_matching_right if student.shuffled_matching_right else list(range(right_count))
 
                 if side == "left":
                     if index < 0 or index >= left_count:
@@ -1972,7 +2035,7 @@ class QuizBot:
                             message["message_id"],
                             f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}",
                             reply_markup=self._build_keyboard(
-                                question.options,
+                                (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                                 question_type="matching",
                                 matching_pairs=student.matching_pairs,
                                 matching_selected_left=student.matching_selected_left,
@@ -1988,7 +2051,7 @@ class QuizBot:
                         message["message_id"],
                         f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОберіть праву букву для {index + 1}.",
                         reply_markup=self._build_keyboard(
-                            question.options,
+                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
@@ -2013,9 +2076,7 @@ class QuizBot:
                             self.api.answer_callback_query(callback_query["id"], "Спочатку обери номер зліва")
                         return
 
-                    current_left = student.matching_selected_left
-
-                    if current_left in student.matching_pairs and student.matching_pairs[current_left] == index:
+                    if student.matching_selected_left in student.matching_pairs and student.matching_pairs[student.matching_selected_left] == index:
                         self.api.answer_callback_query(callback_query["id"], "Ця пара вже зафіксована")
                         return
 
@@ -2026,12 +2087,15 @@ class QuizBot:
                         self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
                         return
 
-                    student.matching_pairs[current_left] = index
+                    student.matching_pairs[student.matching_selected_left] = index
                     student.matching_selected_left = None
                     self._persist_students()
 
                     all_paired = len(student.matching_pairs) >= left_count and left_count > 0
-                    pairs_text = ", ".join(f"{left + 1}{chr(ord('a') + right)}" for left, right in sorted(student.matching_pairs.items())) or "нічого"
+                    pairs_text = ", ".join(
+                        f"{left + 1}{chr(ord('a') + right)}"
+                        for left, right in sorted(student.matching_pairs.items())
+                    ) or "нічого"
                     question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nПари: {pairs_text}"
                     if all_paired:
                         question_text += "\n\n✅ Усі пари відмічено. Тепер доступне лише підтвердження або скидання."
@@ -2041,10 +2105,12 @@ class QuizBot:
                         message["message_id"],
                         question_text,
                         reply_markup=self._build_keyboard(
-                            question.options,
+                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
+                            matching_left_map=left_map,
+                            matching_right_map=right_map,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], f"Пара: {pairs_text}")
@@ -2067,17 +2133,19 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Невідома кнопка")
                 return
             if question.type == "multi":
-                if selected in student.pending_multi_answers:
-                    student.pending_multi_answers.remove(selected)
+                original_selected = student.shuffled_options[selected] if 0 <= selected < len(student.shuffled_options) else selected
+                if original_selected in student.pending_multi_answers:
+                    student.pending_multi_answers.remove(original_selected)
                 else:
-                    student.pending_multi_answers.append(selected)
+                    student.pending_multi_answers.append(original_selected)
                 self._persist_students()
-                chosen_text = ", ".join(question.options[i] for i in sorted(student.pending_multi_answers)) or "нічого"
+                chosen_text = ", ".join(question.options[i] for i in sorted(student.pending_multi_answers) if 0 <= i < len(question.options)) or "нічого"
                 updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОбрано: {chosen_text}"
-                self.api.edit_message_text(chat_id, message["message_id"], updated_text, reply_markup=self._build_keyboard(question.options, question_type="multi", selected_indexes=set(student.pending_multi_answers)))
+                self.api.edit_message_text(chat_id, message["message_id"], updated_text, reply_markup=self._build_keyboard([question.options[i] for i in student.shuffled_options], question_type="multi", selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
                 self.api.answer_callback_query(callback_query["id"], f"Обрано: {chosen_text}")
                 return
-            self._grade_question(student, {selected})
+            original_selected = student.shuffled_options[selected] if 0 <= selected < len(student.shuffled_options) else selected
+            self._grade_question(student, {original_selected})
             self.api.answer_callback_query(callback_query["id"], "Відповідь отримано")
             return
         self.api.answer_callback_query(callback_query["id"], "Невідома кнопка")
