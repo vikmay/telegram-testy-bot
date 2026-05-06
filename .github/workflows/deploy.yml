@@ -38,6 +38,14 @@ jobs:
                       mkdir -p "$REPO_DIR"
                       cd "$REPO_DIR"
 
+                      # Always preserve token.txt (bot requires it to start)
+                      TOKEN_BAK_DIR="$HOME/.deploy_token_backup_${SERVICE_NAME}_$$"
+                      TOKEN_BAK_PATH="$TOKEN_BAK_DIR/token.txt"
+                      mkdir -p "$TOKEN_BAK_DIR"
+                      if [ -f "$REPO_DIR/token.txt" ]; then
+                        cp "$REPO_DIR/token.txt" "$TOKEN_BAK_PATH"
+                      fi
+
                       if [ ! -d ".git" ]; then
                         echo "No .git directory found. Cloning fresh repo (will preserve token.txt / venv / *.db)..."
 
@@ -49,7 +57,7 @@ jobs:
                         VENV_BAK="$BACKUP_DIR/venv"
                         DB_BAK_DIR="$BACKUP_DIR/db"
 
-                        if [ -f "${REPO_DIR}/token.txt" ]; then mv "${REPO_DIR}/token.txt" "$TOKEN_BAK"; fi
+                        if [ -f "${REPO_DIR}/token.txt" ]; then cp "${REPO_DIR}/token.txt" "$TOKEN_BAK"; fi
                         if [ -d "${REPO_DIR}/venv" ]; then mv "${REPO_DIR}/venv" "$VENV_BAK"; fi
 
                         for f in "${REPO_DIR}"/*.db; do
@@ -62,7 +70,10 @@ jobs:
                         git clone --depth 1 --branch "$BRANCH" "${{ secrets.REPO_SSH_URL }}" "$REPO_DIR"
 
                         # Restore preserved items
-                        if [ -f "$TOKEN_BAK" ]; then mv "$TOKEN_BAK" "${REPO_DIR}/token.txt"; fi
+                        if [ -f "$TOKEN_BAK" ]; then
+                          cp "$TOKEN_BAK" "${REPO_DIR}/token.txt"
+                          chmod 600 "${REPO_DIR}/token.txt" || true
+                        fi
                         if [ -d "$VENV_BAK" ]; then mv "$VENV_BAK" "${REPO_DIR}/venv"; fi
                         if [ -n "$(ls -A "$DB_BAK_DIR" 2>/dev/null)" ]; then mv "$DB_BAK_DIR"/*.db "${REPO_DIR}/"; fi
                         rm -rf "$BACKUP_DIR"
@@ -85,6 +96,12 @@ jobs:
                         git reset --hard "origin/$BRANCH"
                       fi
 
+                      # Final safeguard: if token.txt disappeared for any reason, restore from backup
+                      if [ ! -f "$REPO_DIR/token.txt" ] && [ -f "$TOKEN_BAK_PATH" ]; then
+                        cp "$TOKEN_BAK_PATH" "$REPO_DIR/token.txt"
+                        chmod 600 "$REPO_DIR/token.txt" || true
+                      fi
+
                       # Ensure venv exists (systemd ExecStart uses venv/bin/python)
                       if [ ! -x "$REPO_DIR/venv/bin/python" ]; then
                         echo "venv/bin/python not found. Creating venv at $REPO_DIR/venv ..."
@@ -93,3 +110,6 @@ jobs:
 
                       echo "Restarting service: $SERVICE_NAME"
                       sudo systemctl restart "$SERVICE_NAME"
+
+                      # Cleanup token backup dir
+                      rm -rf "$TOKEN_BAK_DIR" 2>/dev/null || true
