@@ -85,5 +85,11 @@ jobs:
                         git reset --hard "origin/$BRANCH"
                       fi
 
+                      # Ensure venv exists (systemd ExecStart uses venv/bin/python)
+                      if [ ! -x "$REPO_DIR/venv/bin/python" ]; then
+                        echo "venv/bin/python not found. Creating venv at $REPO_DIR/venv ..."
+                        sudo -H python3 -m venv "$REPO_DIR/venv"
+                      fi
+
                       echo "Restarting service: $SERVICE_NAME"
                       sudo systemctl restart "$SERVICE_NAME"
