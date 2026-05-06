@@ -42,11 +42,12 @@ jobs:
                         echo "No .git directory found. Cloning fresh repo (will preserve token.txt / venv / *.db)..."
 
                         # Preserve local secrets and state
-                        cd "$HOME"
-                        TOKEN_BAK="${REPO_DIR}/token.txt.bak"
-                        VENV_BAK="${REPO_DIR}/venv.bak"
-                        DB_BAK_DIR="${REPO_DIR}/db.bak"
-                        mkdir -p "$DB_BAK_DIR"
+                        BACKUP_DIR="$HOME/.deploy_backup_${SERVICE_NAME}_$$"
+                        mkdir -p "$BACKUP_DIR/db"
+
+                        TOKEN_BAK="$BACKUP_DIR/token.txt"
+                        VENV_BAK="$BACKUP_DIR/venv"
+                        DB_BAK_DIR="$BACKUP_DIR/db"
 
                         if [ -f "${REPO_DIR}/token.txt" ]; then mv "${REPO_DIR}/token.txt" "$TOKEN_BAK"; fi
                         if [ -d "${REPO_DIR}/venv" ]; then mv "${REPO_DIR}/venv" "$VENV_BAK"; fi
@@ -64,7 +65,7 @@ jobs:
                         if [ -f "$TOKEN_BAK" ]; then mv "$TOKEN_BAK" "${REPO_DIR}/token.txt"; fi
                         if [ -d "$VENV_BAK" ]; then mv "$VENV_BAK" "${REPO_DIR}/venv"; fi
                         if [ -n "$(ls -A "$DB_BAK_DIR" 2>/dev/null)" ]; then mv "$DB_BAK_DIR"/*.db "${REPO_DIR}/"; fi
-                        rmdir "$DB_BAK_DIR" 2>/dev/null || true
+                        rm -rf "$BACKUP_DIR"
 
                         cd "$REPO_DIR"
                       else
@@ -73,8 +74,12 @@ jobs:
 
                         # Important: if this VM repo was initialized manually before cloning,
                         # there may be untracked files that block checkout.
-                        # Clean untracked (but DO NOT remove ignored files like token.txt, venv, *.db).
-                        git clean -fd
+                        # Clean untracked files that can block checkout, but preserve local runtime:
+                        # - token.txt
+                        # - venv/
+                        # - *.db
+                        # - data/state.json (ignored state)
+                        git clean -fd -e token.txt -e venv -e "*.db" -e "data/state.json"
 
                         git checkout -B "$BRANCH" "origin/$BRANCH"
                         git reset --hard "origin/$BRANCH"
