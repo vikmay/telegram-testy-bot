@@ -46,6 +46,12 @@ jobs:
                         cp "$REPO_DIR/token.txt" "$TOKEN_BAK_PATH"
                       fi
 
+                      # If token.txt is missing (it is required), restore from GitHub secret
+                      if [ ! -f "$REPO_DIR/token.txt" ] && [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+                        echo "${{ secrets.TELEGRAM_BOT_TOKEN }}" > "$REPO_DIR/token.txt"
+                        chmod 600 "$REPO_DIR/token.txt" || true
+                      fi
+
                       if [ ! -d ".git" ]; then
                         echo "No .git directory found. Cloning fresh repo (will preserve token.txt / venv / *.db)..."
 
