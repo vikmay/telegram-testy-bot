@@ -70,6 +70,12 @@ jobs:
                       else
                         # Fetch and hard-reset working tree to match remote branch
                         git fetch --prune origin "$BRANCH"
+
+                        # Important: if this VM repo was initialized manually before cloning,
+                        # there may be untracked files that block checkout.
+                        # Clean untracked (but DO NOT remove ignored files like token.txt, venv, *.db).
+                        git clean -fd
+
                         git checkout -B "$BRANCH" "origin/$BRANCH"
                         git reset --hard "origin/$BRANCH"
                       fi
