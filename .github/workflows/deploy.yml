@@ -1,4 +1,4 @@
-name: Deploy Bot
+name: Deploy Telegram Testy Bot
 
 on:
     push:
@@ -10,15 +10,44 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
-            - name: Deploy via SSH
+            - name: Deploy to VM via SSH (git fetch/reset + systemd restart)
               uses: appleboy/ssh-action@v1.0.0
               with:
                   host: ${{ secrets.VM_HOST }}
                   username: ${{ secrets.VM_USER }}
                   key: ${{ secrets.VM_SSH_KEY }}
                   script: |
-                      cd /home/ubuntu/Taras_Testy
-                      git reset --hard
-                      git clean -f
-                      git pull
-                      pm2 restart telegram-bot
+                      set -euo pipefail
+
+                      REPO_DIR="/home/ubuntu/telegram-testy-bot"
+                      SERVICE_NAME="telegram-testy-bot"
+                      BRANCH="main"
+
+                      # Ensure deploy key exists for GitHub access
+                      mkdir -p "$HOME/.ssh"
+                      DEPLOY_KEY_PATH="$HOME/.ssh/deploy_key"
+                      echo "${{ secrets.DEPLOY_KEY }}" > "$DEPLOY_KEY_PATH"
+                      chmod 600 "$DEPLOY_KEY_PATH"
+
+                      # Add github.com to known_hosts to avoid interactive prompt
+                      ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+                      export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+
+                      # Move to repo directory
+                      mkdir -p "$REPO_DIR"
+                      cd "$REPO_DIR"
+
+                      if [ ! -d ".git" ]; then
+                        echo "No .git directory found. Initializing git repo and adding remote..."
+                        git init
+                        git remote add origin "${{ secrets.REPO_SSH_URL }}"
+                      fi
+
+                      # Fetch and hard-reset working tree to match remote branch
+                      git fetch --prune origin "$BRANCH"
+                      git checkout -B "$BRANCH" "origin/$BRANCH"
+                      git reset --hard "origin/$BRANCH"
+
+                      echo "Restarting service: $SERVICE_NAME"
+                      sudo systemctl restart "$SERVICE_NAME"
