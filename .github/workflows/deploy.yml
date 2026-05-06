@@ -39,15 +39,40 @@ jobs:
                       cd "$REPO_DIR"
 
                       if [ ! -d ".git" ]; then
-                        echo "No .git directory found. Initializing git repo and adding remote..."
-                        git init
-                        git remote add origin "${{ secrets.REPO_SSH_URL }}"
-                      fi
+                        echo "No .git directory found. Cloning fresh repo (will preserve token.txt / venv / *.db)..."
 
-                      # Fetch and hard-reset working tree to match remote branch
-                      git fetch --prune origin "$BRANCH"
-                      git checkout -B "$BRANCH" "origin/$BRANCH"
-                      git reset --hard "origin/$BRANCH"
+                        # Preserve local secrets and state
+                        cd "$HOME"
+                        TOKEN_BAK="${REPO_DIR}/token.txt.bak"
+                        VENV_BAK="${REPO_DIR}/venv.bak"
+                        DB_BAK_DIR="${REPO_DIR}/db.bak"
+                        mkdir -p "$DB_BAK_DIR"
+
+                        if [ -f "${REPO_DIR}/token.txt" ]; then mv "${REPO_DIR}/token.txt" "$TOKEN_BAK"; fi
+                        if [ -d "${REPO_DIR}/venv" ]; then mv "${REPO_DIR}/venv" "$VENV_BAK"; fi
+
+                        for f in "${REPO_DIR}"/*.db; do
+                          [ -e "$f" ] || continue
+                          mv "$f" "$DB_BAK_DIR/"
+                        done
+
+                        rm -rf "$REPO_DIR"
+
+                        git clone --depth 1 --branch "$BRANCH" "${{ secrets.REPO_SSH_URL }}" "$REPO_DIR"
+
+                        # Restore preserved items
+                        if [ -f "$TOKEN_BAK" ]; then mv "$TOKEN_BAK" "${REPO_DIR}/token.txt"; fi
+                        if [ -d "$VENV_BAK" ]; then mv "$VENV_BAK" "${REPO_DIR}/venv"; fi
+                        if [ -n "$(ls -A "$DB_BAK_DIR" 2>/dev/null)" ]; then mv "$DB_BAK_DIR"/*.db "${REPO_DIR}/"; fi
+                        rmdir "$DB_BAK_DIR" 2>/dev/null || true
+
+                        cd "$REPO_DIR"
+                      else
+                        # Fetch and hard-reset working tree to match remote branch
+                        git fetch --prune origin "$BRANCH"
+                        git checkout -B "$BRANCH" "origin/$BRANCH"
+                        git reset --hard "origin/$BRANCH"
+                      fi
 
                       echo "Restarting service: $SERVICE_NAME"
                       sudo systemctl restart "$SERVICE_NAME"
