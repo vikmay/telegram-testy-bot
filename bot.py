@@ -916,9 +916,10 @@ class QuizBot:
             student.shuffled_matching_left = session.get("shuffled_matching_left", [])
             student.shuffled_matching_right = session.get("shuffled_matching_right", [])
             raw_current_test_topic_id = session.get("current_test_topic_id")
-            student.current_test_topic_id = (
-                self._normalize_topic_ids([raw_current_test_topic_id])[0] if raw_current_test_topic_id else None
+            normalized_current_topic_ids = (
+                self._normalize_topic_ids([raw_current_test_topic_id]) if raw_current_test_topic_id else []
             )
+            student.current_test_topic_id = normalized_current_topic_ids[0] if normalized_current_topic_ids else None
             student.current_test_score = session.get("current_test_score", 0)
             student.current_test_started_at = session.get("current_test_started_at")
             student.current_test_duration_seconds = session.get("current_test_duration_seconds") or self.test_duration_seconds
