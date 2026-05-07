@@ -1205,11 +1205,17 @@ class QuizBot:
         results = self.results_store.user_results(student.user_id)
         topic_ids = {topic_id for _, _, _, _, _, topic_id, _, _ in results if topic_id}
         total_score = sum(score for _, _, _, score, _, _, _, _ in results)
-        total_attempts = sum(attempts for _, _, _, _, attempts, _, _, _ in results)
         max_score = len(results)
-        accuracy = round((total_score / total_attempts) * 100) if total_attempts else 0
         average_score = round(total_score / max_score, 2) if max_score else 0
-        last_result = results[0][7] if results else None
+
+        # Статистика відповідей (має бути логічною для картки)
+        correct_answers = student.score
+        total_answers = student.total_attempts
+        wrong_answers = max(0, total_answers - correct_answers)
+        accuracy = round((correct_answers / total_answers) * 100) if total_answers else 0
+
+        # “Останній результат” має показувати бал, а не created_at
+        last_score = results[0][3] if results else None
 
         status_icon = "✅" if student.status == "approved" else "⏳" if student.status == "pending_approval" else "🚫" if student.status == "blocked" else "📝"
         status_label = "схвалено" if student.status == "approved" else "очікує схвалення" if student.status == "pending_approval" else "заблоковано" if student.status == "blocked" else "новий"
@@ -1222,11 +1228,11 @@ class QuizBot:
             f"• Тем: {len(topic_ids)}",
             f"• Балів: {student.score}",
             f"• Спроб: {student.total_attempts}",
-            f"• Правильних відповідей: {total_score}",
-            f"• Неправильних відповідей: {max(0, total_attempts - total_score)}",
+            f"• Правильних відповідей: {correct_answers}",
+            f"• Неправильних відповідей: {wrong_answers}",
             f"• Точність: {accuracy}%",
             f"• Середній бал за тест: {average_score}",
-            f"• Останній результат: {last_result or '—'}",
+            f"• Останній результат: {last_score if last_score is not None else '—'}",
         ]
         keyboard = {"inline_keyboard": []}
         if student.status == "approved":
