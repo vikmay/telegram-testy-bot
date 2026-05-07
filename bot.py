@@ -915,7 +915,10 @@ class QuizBot:
             student.shuffled_options = session.get("shuffled_options", [])
             student.shuffled_matching_left = session.get("shuffled_matching_left", [])
             student.shuffled_matching_right = session.get("shuffled_matching_right", [])
-            student.current_test_topic_id = session.get("current_test_topic_id")
+            raw_current_test_topic_id = session.get("current_test_topic_id")
+            student.current_test_topic_id = (
+                self._normalize_topic_ids([raw_current_test_topic_id])[0] if raw_current_test_topic_id else None
+            )
             student.current_test_score = session.get("current_test_score", 0)
             student.current_test_started_at = session.get("current_test_started_at")
             student.current_test_duration_seconds = session.get("current_test_duration_seconds") or self.test_duration_seconds
@@ -942,7 +945,15 @@ class QuizBot:
             student.shuffled_options = [int(index) for index in student.shuffled_options if isinstance(index, int) or str(index).isdigit()]
             student.shuffled_matching_left = [int(index) for index in student.shuffled_matching_left if isinstance(index, int) or str(index).isdigit()]
             student.shuffled_matching_right = [int(index) for index in student.shuffled_matching_right if isinstance(index, int) or str(index).isdigit()]
-            student.topic_stats = {topic_id: {"correct": 0, "total": 0} for topic_id in student.selected_topic_ids} if not student.topic_stats else student.topic_stats
+            # Keep topic_stats consistent with the normalized selected_topic_ids
+            # (drop stale keys that no longer exist as topics)
+            if student.topic_stats:
+                student.topic_stats = {
+                    topic_id: student.topic_stats.get(topic_id, {"correct": 0, "total": 0})
+                    for topic_id in student.selected_topic_ids
+                }
+            else:
+                student.topic_stats = {topic_id: {"correct": 0, "total": 0} for topic_id in student.selected_topic_ids}
             student.current_test_duration_seconds = student.current_test_duration_seconds or self.test_duration_seconds
             if student.user_id in self.admin_user_ids and student.status in {"new", "awaiting_name", "pending_approval"}:
                 student.status = "approved"
@@ -1047,10 +1058,35 @@ class QuizBot:
         return topic_id if self._topic_by_id(topic_id) else ""
 
     def _normalize_topic_ids(self, topic_ids: List[str]) -> List[str]:
-        cleaned = []
-        for topic_id in topic_ids:
-            if self._topic_by_id(topic_id) and topic_id not in cleaned:
-                cleaned.append(topic_id)
+        """
+        Normalizes a list of raw topic identifiers into valid topic_id values that:
+        - exist in self.topics
+        - are active
+        - are unique (preserve order)
+        
+        Also supports legacy state where value could be stored as topic name instead of topic_id.
+        """
+        cleaned: List[str] = []
+        if not topic_ids:
+            return cleaned
+
+        topic_by_id: Dict[str, Topic] = {t.id: t for t in self.topics}
+        topic_by_name: Dict[str, Topic] = {t.name.casefold(): t for t in self.topics if t.name}
+
+        for raw in topic_ids:
+            if raw is None:
+                continue
+            raw_str = str(raw).strip()
+            if not raw_str:
+                continue
+
+            topic = topic_by_id.get(raw_str)
+            if not topic:
+                topic = topic_by_name.get(raw_str.casefold())
+
+            if topic and topic.active and topic.id not in cleaned:
+                cleaned.append(topic.id)
+
         return cleaned
 
     def _add_topic(self, name: str) -> bool:
@@ -1452,7 +1488,26 @@ class QuizBot:
         student.delete_action_source = None
         student.matching_pairs = {}
         student.matching_selected_left = None
-        topic_ids = [topic_id] if topic_id else student.selected_topic_ids or [DEFAULT_TEST_TOPIC_NAME]
+        # Resolve topic_id safely:
+        # - prefer explicit topic_id if it exists in self.topics
+        # - otherwise use student.selected_topic_ids
+        # - otherwise fallback to DEFAULT_TEST_TOPIC_NAME (mapped to its topic.id)
+        # This prevents "topic name/id" mixups causing tests to start from a wrong topic.
+        default_topic = self._find_topic_by_name(DEFAULT_TEST_TOPIC_NAME)
+        default_topic_id = default_topic.id if default_topic else (self.topics[0].id if self.topics else None)
+
+        resolved_topic_id: Optional[str] = None
+        if topic_id and self._topic_by_id(topic_id):
+            resolved_topic_id = topic_id
+        elif topic_id:
+            matched_by_name = self._find_topic_by_name(str(topic_id))
+            resolved_topic_id = matched_by_name.id if matched_by_name else None
+
+        if resolved_topic_id:
+            topic_ids = [resolved_topic_id]
+        else:
+            topic_ids = student.selected_topic_ids or ([default_topic_id] if default_topic_id else [])
+
         available = self._available_questions(topic_ids)
         if not available:
             self.api.send_message(student.chat_id, "Немає питань для обраної теми.")
