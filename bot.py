@@ -1240,7 +1240,7 @@ class QuizBot:
         keyboard = []
         if is_admin:
             keyboard.extend([[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -1 хв", "callback_data": "admin:time:-60"}, {"text": "⏱ +1 хв", "callback_data": "admin:time:+60"}], [{"text": "⏱ -10 с", "callback_data": "admin:time:-10"}, {"text": "⏱ +10 с", "callback_data": "admin:time:+10"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]])
-        keyboard.append([{"text": "📚 Пройти Тести", "callback_data": "back_to_topics"}])
+        keyboard.append([{"text": "📚 Пройти Всі Тести", "callback_data": "back_to_topics"}])
         return {"inline_keyboard": keyboard}
 
     def _time_is_up(self, student: StudentState) -> bool:
