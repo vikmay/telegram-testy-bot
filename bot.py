@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from services.stats_service import StatsService
-
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -132,7 +130,6 @@ class ResultsStore:
                     attempts INTEGER NOT NULL,
                     topic_id TEXT,
                     topic_name TEXT,
-                    questions_count INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -143,8 +140,6 @@ class ResultsStore:
                 conn.execute("ALTER TABLE test_results ADD COLUMN topic_id TEXT")
             if "topic_name" not in cols:
                 conn.execute("ALTER TABLE test_results ADD COLUMN topic_name TEXT")
-            if "questions_count" not in cols:
-                conn.execute("ALTER TABLE test_results ADD COLUMN questions_count INTEGER")
             conn.commit()
 
     def topic_accuracy(self, user_id: int) -> Dict[str, float]:
@@ -152,18 +147,15 @@ class ResultsStore:
             cursor = conn.execute(
                 """
                 SELECT COALESCE(topic_id, ''),
-                       SUM(COALESCE(score, 0)) AS correct_score,
-                       SUM(COALESCE(questions_count, ?)) AS total_questions
+                       SUM(CASE WHEN score > 0 THEN 1 ELSE 0 END) AS correct_count,
+                       COUNT(*) AS total_count
                 FROM test_results
                 WHERE user_id = ?
                 GROUP BY COALESCE(topic_id, '')
                 """,
-                (DEFAULT_TEST_LENGTH, user_id),
+                (user_id,),
             )
-            return {
-                topic_id: float(correct_score or 0) / float(total_questions or DEFAULT_TEST_LENGTH)
-                for topic_id, correct_score, total_questions in cursor.fetchall()
-            }
+            return {topic_id: float(correct or 0) / float(total or 1) for topic_id, correct, total in cursor.fetchall()}
 
     def user_results(self, user_id: int) -> List[Tuple[int, int, str, int, int, str, str, str]]:
         with self._connect() as conn:
@@ -181,20 +173,11 @@ class ResultsStore:
             )
             return int(cursor.fetchone()[0] or 0) + 1
 
-    def add_result(
-        self,
-        user_id: int,
-        full_name: str,
-        score: int,
-        attempts: int,
-        topic_id: str = "",
-        topic_name: str = "",
-        questions_count: int = DEFAULT_TEST_LENGTH,
-    ):
+    def add_result(self, user_id: int, full_name: str, score: int, attempts: int, topic_id: str = "", topic_name: str = ""):
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO test_results (user_id, full_name, score, attempts, topic_id, topic_name, questions_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, full_name, score, attempts, topic_id, topic_name, questions_count),
+                "INSERT INTO test_results (user_id, full_name, score, attempts, topic_id, topic_name) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, full_name, score, attempts, topic_id, topic_name),
             )
             conn.commit()
 
@@ -209,11 +192,6 @@ class ResultsStore:
         with self._connect() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM test_results WHERE user_id = ?", (user_id,))
             return int(cursor.fetchone()[0] or 0)
-
-    def delete_student_history(self, user_id: int):
-        with self._connect() as conn:
-            conn.execute("DELETE FROM test_results WHERE user_id = ?", (user_id,))
-            conn.commit()
 
 
 class SessionStore:
@@ -429,31 +407,6 @@ class SessionStore:
             )
             conn.commit()
 
-    def get_last_activity_at(self, user_id: int) -> Optional[str]:
-        """
-        Returns student_sessions.updated_at as string or None.
-        Safe fallback for missing column/rows.
-        """
-        try:
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    "SELECT updated_at FROM student_sessions WHERE user_id = ?",
-                    (user_id,),
-                )
-                row = cursor.fetchone()
-                if not row:
-                    return None
-                value = row[0]
-                if value in (None, ""):
-                    return None
-                return str(value)
-        except sqlite3.Error:
-            return None
-
-    def get_updated_at_at(self, user_id: int) -> Optional[str]:
-        # compatibility alias
-        return self.get_last_activity_at(user_id)
-
     def delete_student(self, user_id: int):
         with self._connect() as conn:
             conn.execute("DELETE FROM student_sessions WHERE user_id = ?", (user_id,))
@@ -514,24 +467,10 @@ class QuizBot:
         self.topics_store = JsonStore(TOPICS_FILE, [])
         self.results_store = ResultsStore(RESULTS_DB_FILE)
         self.sessions_store = SessionStore(SESSIONS_DB_FILE)
-        self.stats_service = StatsService(
-            results_store=self.results_store,
-            sessions_store=self.sessions_store,
-            topic_name_fn=lambda topic_id: self._topic_name(topic_id),
-            default_test_length=DEFAULT_TEST_LENGTH,
-        )
         self.api = BotApi(self.token)
         self.students: Dict[str, StudentState] = {}
         self.questions: List[Question] = []
         self.topics: List[Topic] = []
-
-        # Tombstones: prevents `_get_student()` from recreating a deleted student record.
-        raw_state = self.state_store.load()
-        deleted_keys_raw = raw_state.get("deleted_student_keys", [])
-        self.deleted_student_keys: Set[str] = (
-            {str(k) for k in deleted_keys_raw} if isinstance(deleted_keys_raw, list) else set()
-        )
-
         self.test_duration_seconds = self._load_test_duration_seconds()
         self._load_data()
 
@@ -559,12 +498,7 @@ class QuizBot:
             return DEFAULT_TEST_DURATION_SECONDS
 
     def _persist_state(self):
-        self.state_store.save(
-            {
-                "test_duration_seconds": self.test_duration_seconds,
-                "deleted_student_keys": sorted(getattr(self, "deleted_student_keys", set())),
-            }
-        )
+        self.state_store.save({"test_duration_seconds": self.test_duration_seconds})
 
     def _migrate_topics_payload(self, raw) -> List[Topic]:
         topics: List[Topic] = []
@@ -949,13 +883,6 @@ class QuizBot:
         for key, row in student_rows.items():
             if not isinstance(row, dict):
                 continue
-            try:
-                user_id_int = int(key)
-            except (TypeError, ValueError):
-                user_id_int = None
-            if user_id_int is not None and user_id_int in self.admin_user_ids:
-                continue
-
             normalized_row = dict(row)
             legacy_selected_topics = normalized_row.pop("selected_topics", None)
             legacy_current_test_topic = normalized_row.pop("current_test_topic", None)
@@ -970,15 +897,7 @@ class QuizBot:
             if "current_test_duration_seconds" not in normalized_row and legacy_current_test_duration_minutes is not None:
                 normalized_row["current_test_duration_seconds"] = int(legacy_current_test_duration_minutes or 0) * 60 or None
             self.students[key] = StudentState(**normalized_row)
-
         for key, session in session_rows.items():
-            try:
-                user_id_int = int(key)
-            except (TypeError, ValueError):
-                user_id_int = None
-            if user_id_int is not None and user_id_int in self.admin_user_ids:
-                continue
-
             student = self.students.get(key)
             if not student:
                 continue
@@ -1043,13 +962,6 @@ class QuizBot:
     def _persist_students(self):
         payload = {}
         for key, state in self.students.items():
-            # Admins must not be persisted as "students".
-            if state.user_id in self.admin_user_ids:
-                continue
-            # Tombstone placeholder: don't persist deleted records.
-            if state.status == "deleted":
-                continue
-
             payload[key] = {
                 "user_id": state.user_id,
                 "chat_id": state.chat_id,
@@ -1062,8 +974,6 @@ class QuizBot:
             }
         self.students_store.save(payload)
         for state in self.students.values():
-            if state.status == "deleted":
-                continue
             self.sessions_store.save_student(state)
 
     def _student_key(self, user_id: int) -> str:
@@ -1071,20 +981,9 @@ class QuizBot:
 
     def _get_student(self, user_id: int, chat_id: int) -> StudentState:
         key = self._student_key(user_id)
-        if key in getattr(self, "deleted_student_keys", set()):
-            # Tombstone: don't recreate in-memory students after admin delete.
-            # Use a non-empty label so admin lists/cards don't show "без імені".
-            return StudentState(
-                user_id=user_id,
-                chat_id=chat_id,
-                status="deleted",
-                full_name=f"Учень {user_id}",
-            )
-
         if key not in self.students:
             self.students[key] = StudentState(user_id=user_id, chat_id=chat_id)
             self._persist_students()
-
         student = self.students[key]
         student.chat_id = chat_id
         return student
@@ -1286,81 +1185,64 @@ class QuizBot:
         self.api.send_message(chat_id, "Керування темами:", reply_markup={"inline_keyboard": keyboard})
 
     def _build_students_keyboard(self):
-        # Modern compact ranking (Duolingo/Quizizz style)
-        try:
-            students_for_ranking = {
-                k: s
-                for k, s in self.students.items()
-                if getattr(s, "status", "new") != "deleted" and str(getattr(s, "user_id")) not in self.deleted_student_keys
-            }
-            keyboard_rows = self.stats_service.build_students_ranking_buttons(students_for_ranking)
-        except Exception:
-            # Fallback to legacy list (must never break admin UI)
-            keyboard_rows = []
-            for student in sorted(self.students.values(), key=lambda item: item.user_id):
-                status_icon = (
-                    "✅" if student.status == "approved" else
-                    "⏳" if student.status == "pending_approval" else
-                    "🚫" if student.status == "blocked" else
-                    "📝"
-                )
-                total_tests = self.results_store.user_result_count(student.user_id)
-                name_label = (
-                    f"{student.full_name or 'Без імені'} | "
-                    f"📚 {total_tests} | {status_icon}"
-                )
-                keyboard_rows.append([{"text": name_label, "callback_data": f"student:view:{student.user_id}"}])
-
-        keyboard_rows.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
-        return {"inline_keyboard": keyboard_rows}
+        keyboard = []
+        for student in sorted(self.students.values(), key=lambda item: item.user_id):
+            status_icon = "✅" if student.status == "approved" else "⏳" if student.status == "pending_approval" else "🚫" if student.status == "blocked" else "📝"
+            total_tests = self.results_store.user_result_count(student.user_id)
+            name_label = (
+                f"{student.full_name or 'Без імені'} | "
+                f"тести: {total_tests} | "
+                f"бали: {student.score} | "
+                f"спроби: {student.total_attempts} | "
+                f"{status_icon}"
+            )
+            keyboard.append([{"text": name_label, "callback_data": f"student:view:{student.user_id}"}])
+        keyboard.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
+        return {"inline_keyboard": keyboard}
 
     def _show_student_details(self, chat_id: int, student: StudentState):
-        # New modern profile card
-        full_name = (
-            student.full_name
-            or f"{student.first_name} {student.last_name}".strip()
-            or str(student.user_id)
-        )
+        total_tests = self.results_store.user_result_count(student.user_id)
+        results = self.results_store.user_results(student.user_id)
+        topic_ids = {topic_id for _, _, _, _, _, topic_id, _, _ in results if topic_id}
+        total_score = sum(score for _, _, _, score, _, _, _, _ in results)
+        max_score = len(results)
+        average_score = round(total_score / max_score, 2) if max_score else 0
 
-        try:
-            analytics = self.stats_service.compute_student_analytics(
-                user_id=student.user_id,
-                full_name=full_name,
-                status=student.status,
-            )
-            text = self.stats_service.format_student_profile(analytics)
-        except Exception:
-            # Fallback to legacy (never break)
-            total_tests = self.results_store.user_result_count(student.user_id)
-            lines = [
-                "📌 Карточка учня:",
-                f"• Ім'я: {full_name}",
-                f"• ID: {student.user_id}",
-                f"• Тестів: {total_tests}",
-            ]
-            text = "\n".join(lines)
+        # Статистика відповідей (має бути логічною для картки)
+        correct_answers = student.score
+        total_answers = student.total_attempts
+        wrong_answers = max(0, total_answers - correct_answers)
+        accuracy = round((correct_answers / total_answers) * 100) if total_answers else 0
 
+        # “Останній результат” має показувати бал, а не created_at
+        last_score = results[0][3] if results else None
+
+        status_icon = "✅" if student.status == "approved" else "⏳" if student.status == "pending_approval" else "🚫" if student.status == "blocked" else "📝"
+        status_label = "схвалено" if student.status == "approved" else "очікує схвалення" if student.status == "pending_approval" else "заблоковано" if student.status == "blocked" else "новий"
+        lines = [
+            "👤 Картка учня:",
+            f"• Ім'я: {student.full_name or 'без імені'}",
+            f"• ID: {student.user_id}",
+            f"• Статус: {status_icon} {status_label}",
+            f"• Тестів: {total_tests}",
+            f"• Тем: {len(topic_ids)}",
+            f"• Балів: {student.score}",
+            f"• Спроб: {student.total_attempts}",
+            f"• Правильних відповідей: {correct_answers}",
+            f"• Неправильних відповідей: {wrong_answers}",
+            f"• Точність: {accuracy}%",
+            f"• Середній бал за тест: {average_score}",
+            f"• Останній результат: {last_score if last_score is not None else '—'}",
+        ]
         keyboard = {"inline_keyboard": []}
         if student.status == "approved":
-            keyboard["inline_keyboard"].append(
-                [{"text": "🚫 Заблокувати", "callback_data": f"student:block:{student.user_id}"}]
-            )
+            keyboard["inline_keyboard"].append([{"text": "🚫 Заблокувати", "callback_data": f"student:block:{student.user_id}"}])
         else:
-            keyboard["inline_keyboard"].append(
-                [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
-            )
-
-        keyboard["inline_keyboard"].append(
-            [{"text": "🗑 Видалити учня", "callback_data": f"student:delete:{student.user_id}"}]
-        )
-        keyboard["inline_keyboard"].append(
-            [{"text": "⬅️ До списку учнів", "callback_data": "admin:students"}]
-        )
-        keyboard["inline_keyboard"].append(
-            [{"text": "🏠 Головне меню", "callback_data": "main_menu"}]
-        )
-
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+            keyboard["inline_keyboard"].append([{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}])
+        keyboard["inline_keyboard"].append([{"text": "🗑 Видалити учня", "callback_data": f"student:delete:{student.user_id}"}])
+        keyboard["inline_keyboard"].append([{"text": "⬅️ До списку учнів", "callback_data": "admin:students"}])
+        keyboard["inline_keyboard"].append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
+        self.api.send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
 
     def _build_post_test_keyboard(self):
         return {"inline_keyboard": [[{"text": "🔁 Пройти ще раз", "callback_data": "restart_test"}], [{"text": "⬅️ До тем", "callback_data": "back_to_topics"}], [{"text": "🏠 Головне меню", "callback_data": "main_menu"}]]}
@@ -1432,7 +1314,7 @@ class QuizBot:
             self._persist_students()
             self.api.send_message(chat["id"], "Введи ім'я та прізвище одним повідомленням.")
             return
-        if student.status != "approved":
+        if student.status != "approved" and user["id"] not in self.admin_user_ids:
             self.api.send_message(chat["id"], "Твоя анкета ще не схвалена адміністрацією.")
             return
         self._show_main_menu(chat["id"], user["id"])
@@ -1583,248 +1465,26 @@ class QuizBot:
         ]
         self.api.send_message(chat_id, "\n".join(lines))
 
-    def _send_results_report(
-        self,
-        chat_id: int,
-        target_user_id: Optional[int] = None,
-        page: int = 0,
-        limit: int = 15,
-    ):
-        """
-        Admin "results" dashboard:
-        - Global (target_user_id=None): weak topics + weak students summary (dashboard) with pagination over topics
-        - Per-user (target_user_id=<id>): compact last results with percent
-        """
-        limit = max(1, int(limit))
-        page = max(0, int(page))
-
-        def score_emoji(score_value: int) -> str:
-            if int(score_value) >= 7:
-                return "🟢"
-            if 4 <= int(score_value) <= 6:
-                return "🟡"
-            return "🔴"
-
-        def score_percent(score_value: int) -> int:
-            # score is number correct out of DEFAULT_TEST_LENGTH (usually 10)
-            denom = max(1, DEFAULT_TEST_LENGTH)
-            return int(round((float(score_value) / float(denom)) * 100.0))
-
+    def _send_results_report(self, chat_id: int, target_user_id: Optional[int] = None):
         if target_user_id is None:
-            all_rows = self.results_store.list_results()
-            if not all_rows:
-                self.api.send_message(
-                    chat_id,
-                    "📊 Дашборд результатів\n\nНемає результатів.",
-                    reply_markup=self._build_back_to_main_keyboard(),
-                )
+            rows = self.results_store.list_results()
+            if not rows:
+                self.api.send_message(chat_id, "📊 Усі результати:\n\nПоки що немає результатів.", reply_markup=self._build_back_to_main_keyboard())
                 return
-
-            # ---- Aggregate topics globally ----
-            topic_aggs: Dict[str, Dict[str, float]] = {}
-            for _rid, _uid, _full_name, score, _attempts, topic_id, topic_name, _created_at in all_rows:
-                tid = topic_id or ""
-                if not tid:
-                    continue
-                key = tid
-                if key not in topic_aggs:
-                    topic_aggs[key] = {"sum": 0.0, "count": 0.0}
-                topic_aggs[key]["sum"] += float(score)
-                topic_aggs[key]["count"] += 1.0
-
-            topic_list: List[Tuple[str, str, float, int]] = []
-            for tid, agg in topic_aggs.items():
-                count = int(agg["count"])
-                if count <= 0:
-                    continue
-                avg = float(agg["sum"]) / float(count)
-                label = (self._topic_name(tid) if tid else "—")
-                topic_list.append((tid, label, avg, count))
-
-            topic_list.sort(key=lambda x: (x[2], -x[3], x[1].lower()))  # weak -> strong
-            total_topics = len(topic_list)
-            page_count = (total_topics + limit - 1) // limit
-            page = min(page, max(0, page_count - 1))
-            start = page * limit
-            shown_topics = topic_list[start : start + limit]
-
-            # ---- Weak students summary ----
-            # group by user_id across all_rows
-            student_aggs: Dict[int, Dict[str, float]] = {}
-            student_names: Dict[int, str] = {}
-            for _rid, uid, full_name, score, _attempts, _topic_id, _topic_name, _created_at in all_rows:
-                uid_int = int(uid)
-                # If admin deleted this student (tombstone), don't include it in ranking lists.
-                if str(uid_int) in getattr(self, "deleted_student_keys", set()):
-                    continue
-
-                student_names[uid_int] = full_name or student_names.get(uid_int, "") or str(uid_int)
-                if uid_int not in student_aggs:
-                    student_aggs[uid_int] = {"sum": 0.0, "count": 0.0}
-                student_aggs[uid_int]["sum"] += float(score)
-                student_aggs[uid_int]["count"] += 1.0
-
-            students_list: List[Tuple[int, str, float, int]] = []
-            for uid, agg in student_aggs.items():
-                cnt = int(agg["count"])
-                if cnt <= 0:
-                    continue
-                avg = float(agg["sum"]) / float(cnt)
-                students_list.append((uid, student_names.get(uid, f"Учень {uid}"), avg, cnt))
-
-            # weak students -> low avg first
-            # "weak students" = ті, хто:
-            # 1) не проходив тести (tests_count = 0)
-            # 2) або має дуже низький avg (avg <= 3/10)
-            # Візуально це відповідає легенді 🔴, а не "топ-10 найнижчих серед тих, хто має результати".
-            approved_students = [
-                s
-                for s in self.students.values()
-                if getattr(s, "status", "new") == "approved"
-                and str(getattr(s, "user_id")) not in getattr(self, "deleted_student_keys", set())
-            ]
-            approved_student_ids = {int(s.user_id) for s in approved_students}
-            student_name_map = {
-                int(s.user_id): (
-                    (s.full_name if s.full_name and s.full_name not in {"Без імені", "Без имени"} else "")
-                    or f"{s.first_name} {s.last_name}".strip()
-                    or f"Учень {s.user_id}"
-                )
-                for s in approved_students
-            }
-
-            passed_ids = {t[0] for t in students_list}
-            ordered_students = sorted(students_list, key=lambda x: (x[2], -x[3], x[1].lower()))
-
-            not_passed_students: List[Tuple[int, str, float, int]] = []
-            for uid in approved_student_ids:
-                if uid not in passed_ids:
-                    not_passed_students.append((uid, student_name_map.get(uid, f"Учень {uid}"), 0.0, 0))
-
-            low_students = [t for t in ordered_students if t[2] < 4.0]
-
-            weak_students = (not_passed_students + low_students)[:10]
-
-
-            legend = "🟢 7-10/10 — добре; 🟡 4-7/10 — середній рівень; 🔴 avg<4/10 — потрібно підтягнути. Також показані ті, хто НЕ проходив тести."
-            # counts for "учнів у групах"
-            total_users_in_results = len(student_aggs)
-            lines = [
-                f"📊 Аналіз результатів: лідери та підтримка",
-                legend,
-                "",
-                f"👥 Показано: ? / {total_users_in_results} (учні з results.db)",
-                "",
-                f"📖 Найслабші теми (сторінка {page+1}/{page_count})",
-            ]
-            if not shown_topics:
-                lines.append("—")
-            for idx, (_tid, label, avg, cnt) in enumerate(shown_topics, start=1 + start):
-                avg_int = int(round(avg))
-                emoji = score_emoji(avg_int)
-                lines.append(f"{idx}) {label} — {avg:.1f}/{DEFAULT_TEST_LENGTH} {emoji} (спроб: {cnt})")
-
-            lines.append("")
-            # 3 groups: leaders -> mid -> help-needed (each up to 10 rows)
-            leaders_students = [t for t in ordered_students if t[2] >= 7.0]
-            leaders_students = sorted(leaders_students, key=lambda x: (-x[2], -x[3], x[1].lower()))[:10]
-
-            mid_students = [t for t in ordered_students if 4.0 <= t[2] < 7.0]
-            mid_students = sorted(mid_students, key=lambda x: (-x[2], -x[3], x[1].lower()))[:10]
-
-            help_students = weak_students[:10]
-
-            # fill in "Показано" line (leaders/mid/help must exist first)
-            shown_in_groups = len(leaders_students) + len(mid_students) + len(help_students)
-            for i, line in enumerate(lines):
-                if line.startswith("👥 Показано:"):
-                    lines[i] = f"👥 Показано: {shown_in_groups} / {total_users_in_results} (учні з results.db)"
-                    break
-
-            lines.append("🏆 Лідери")
-            for rank, (uid, nm, avg, cnt) in enumerate(leaders_students, start=1):
-                avg_int = int(round(avg))
-                emoji = score_emoji(avg_int)
-                acc = score_percent(avg_int)
-                lines.append(f"{rank}) {nm} — {avg:.1f}/{DEFAULT_TEST_LENGTH} {emoji} — 🎯{acc}% (тести: {cnt})")
-
-            lines.append("")
-            if mid_students:
-                lines.append("🟡 Середній рівень")
-            for rank, (uid, nm, avg, cnt) in enumerate(mid_students, start=1):
-                avg_int = int(round(avg))
-                emoji = score_emoji(avg_int)
-                acc = score_percent(avg_int)
-                lines.append(f"{rank}) {nm} — {avg:.1f}/{DEFAULT_TEST_LENGTH} {emoji} — 🎯{acc}% (тести: {cnt})")
-
-            lines.append("")
-            lines.append("👥 Учні, яким потрібна допомога")
-            for rank, (uid, nm, avg, cnt) in enumerate(help_students, start=1):
-                avg_int = int(round(avg))
-                emoji = score_emoji(avg_int)
-                acc = score_percent(avg_int)
-                lines.append(f"{rank}) {nm} — {avg:.1f}/{DEFAULT_TEST_LENGTH} {emoji} — 🎯{acc}% (тести: {cnt})")
-
-            # pagination buttons for global topics
-            inline_keyboard = []
-            nav = []
-            if page > 0:
-                nav.append({"text": "⬅️", "callback_data": f"admin:results:page:{page-1}"})
-            if page + 1 < page_count:
-                nav.append({"text": "➡️", "callback_data": f"admin:results:page:{page+1}"})
-            if nav:
-                inline_keyboard.append(nav)
-
-            inline_keyboard.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
-            self.api.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": inline_keyboard})
+            lines = ["📊 Усі результати:"]
+            for _, _, full_name, score, attempts, topic_id, topic_name, created_at in rows:
+                lines.append(f"• {full_name} | балів: {score} | спроб: {attempts} | тема: {topic_name or self._topic_name(topic_id)} | {created_at}")
+            self._send_chunked_message(chat_id, "\n".join(lines), reply_markup=self._build_back_to_main_keyboard())
             return
-
-        # ---- per-user: keep list but add percent ----
         rows = self.results_store.user_results(target_user_id)
         if not rows:
-            student = self.students.get(str(target_user_id))
-            student_name = (
-                getattr(student, "full_name", "").strip()
-                or f"{getattr(student, 'first_name', '').strip()} {getattr(student, 'last_name', '').strip()}".strip()
-                or str(target_user_id)
-            ) if student else str(target_user_id)
-
-            self.api.send_message(
-                chat_id,
-                f"📊 Результати учня {student_name}\n\nНе здавав тести: 0 спроб.",
-                reply_markup=self._build_back_to_main_keyboard(),
-            )
+            self.api.send_message(chat_id, f"📊 Результати учня {target_user_id}:\n\nНемає результатів.", reply_markup=self._build_back_to_main_keyboard())
             return
-
         full_name = rows[0][2] or f"Учень {target_user_id}"
-        total = len(rows)
-        page_count = (total + limit - 1) // limit
-        page = min(page, max(0, page_count - 1))
-        start = page * limit
-        shown = rows[start : start + limit]
-
-        lines = [f"📊 Останні результати: {full_name} (сторінка {page+1}/{page_count})"]
-        for _result_id, _uid, _nm, score, _attempts, topic_id, topic_name, created_at in shown:
-            score_int = int(score)
-            emoji = score_emoji(score_int)
-            percent = score_percent(score_int)
-            date_short = str(created_at)[:10].replace("-", ".") if created_at else "—"
-            t_label = topic_name or self._topic_name(topic_id)
-            lines.append(f"{emoji} {date_short} — {t_label} — {score_int}/{DEFAULT_TEST_LENGTH} ({percent}%)")
-
-        inline_keyboard = []
-        nav = []
-        if page > 0:
-            nav.append({"text": "⬅️", "callback_data": f"admin:results:user:{target_user_id}:page:{page-1}"})
-        if page + 1 < page_count:
-            nav.append({"text": "➡️", "callback_data": f"admin:results:user:{target_user_id}:page:{page+1}"})
-        if nav:
-            inline_keyboard.append(nav)
-
-        inline_keyboard.append([{"text": "⬅️ До учнів", "callback_data": "admin:students"}])
-        inline_keyboard.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
-
-        self.api.send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": inline_keyboard})
+        lines = [f"📊 Результати учня: {full_name}", ""]
+        for result_id, _, _, score, attempts, topic_id, topic_name, created_at in rows:
+            lines.extend([f"• Спроба #{result_id}", f"  Тема: {topic_name or self._topic_name(topic_id)}", f"  Бали: {score}", f"  Кількість спроб: {attempts}", f"  Дата: {created_at}", ""])
+        self._send_chunked_message(chat_id, "\n".join(lines).rstrip(), reply_markup=self._build_back_to_main_keyboard())
 
     def _start_test(self, student: StudentState, topic_id: Optional[str] = None):
         student.awaiting_topic_action = False
@@ -1835,17 +1495,6 @@ class QuizBot:
         student.delete_action_source = None
         student.matching_pairs = {}
         student.matching_selected_left = None
-
-        # Guard: не дозволяємо стартувати тест, якщо студент заблокований/не схвалений
-        if student.status != "approved" and student.user_id not in self.admin_user_ids:
-            student.current_test = []
-            student.current_index = 0
-            student.current_question_id = None
-            student.current_question_message_id = None
-            self._persist_students()
-            self.api.send_message(student.chat_id, "Анкета заблокована або не схвалена.")
-            return
-
         # Resolve topic_id safely:
         # - prefer explicit topic_id if it exists in self.topics
         # - otherwise use student.selected_topic_ids
@@ -2038,15 +1687,7 @@ class QuizBot:
         if student.current_index >= len(student.current_test):
             topic_id = student.current_test_topic_id or question.topic_id
             attempts = self.results_store.next_attempt_number(student.user_id, topic_id)
-            self.results_store.add_result(
-                student.user_id,
-                student.full_name or f"{student.first_name} {student.last_name}".strip() or str(student.user_id),
-                student.current_test_score,
-                attempts,
-                topic_id=topic_id,
-                topic_name=self._topic_name(topic_id),
-                questions_count=len(student.current_test) if isinstance(student.current_test, list) else DEFAULT_TEST_LENGTH,
-            )
+            self.results_store.add_result(student.user_id, student.full_name or f"{student.first_name} {student.last_name}".strip() or str(student.user_id), student.current_test_score, attempts, topic_id=topic_id, topic_name=self._topic_name(topic_id))
             student.current_question_id = None
             student.current_question_message_id = None
             student.current_test_topic_id = None
@@ -2078,48 +1719,10 @@ class QuizBot:
                 self._handle_admin_command({"chat": message["chat"], "from": user, "text": "/students"})
                 self.api.answer_callback_query(callback_query["id"], "Відкрито список учнів")
                 return
-
-            # Results: supports pagination
-            # admin:results -> page 0
-            # admin:results:page:<n> -> global results page n
-            # admin:results:user:<user_id> -> user results page 0
-            # admin:results:user:<user_id>:page:<n> -> user results page n
             if action == "results":
-                self._send_results_report(chat_id, target_user_id=None, page=0)
+                self._send_results_report(chat_id)
                 self.api.answer_callback_query(callback_query["id"], "Відкрито результати")
                 return
-
-            if action.startswith("results:page:"):
-                try:
-                    page = int(action.split(":", 2)[2])
-                except (IndexError, ValueError):
-                    page = 0
-                self._send_results_report(chat_id, target_user_id=None, page=page)
-                self.api.answer_callback_query(callback_query["id"], "Перегляд сторінки")
-                return
-
-            if action.startswith("results:user:"):
-                parts = action.split(":")
-                # results:user:<user_id>[:page:<n>]
-                if len(parts) >= 3:
-                    user_part = parts[2]
-                    try:
-                        target_user_id = int(user_part)
-                    except ValueError:
-                        self.api.answer_callback_query(callback_query["id"], "Невірний user_id")
-                        return
-
-                    page = 0
-                    if len(parts) >= 5 and parts[3] == "page":
-                        try:
-                            page = int(parts[4])
-                        except (ValueError, IndexError):
-                            page = 0
-
-                    self._send_results_report(chat_id, target_user_id=target_user_id, page=page)
-                    self.api.answer_callback_query(callback_query["id"], "Перегляд результатів")
-                    return
-
             if action.startswith("time:"):
                 time_action = action.split(":", 1)[1]
                 if time_action == "show":
@@ -2240,25 +1843,6 @@ class QuizBot:
                 return
             if action.startswith("confirm_delete:"):
                 _, mode, target_id = action.split(":", 2)
-                if mode == "student":
-                    try:
-                        target_id_int = int(target_id)
-                    except (TypeError, ValueError):
-                        self.api.answer_callback_query(callback_query["id"], "Некоректний ID")
-                        return
-
-                    target_student = self.students.get(target_id)
-                    if target_student and target_id in self.students:
-                        del self.students[target_id]
-                        self.sessions_store.delete_student(target_id_int)
-                        self.results_store.delete_student_history(target_id_int)
-                        self._persist_students()
-                        self.api.send_message(chat_id, "Учня видалено.", reply_markup=self._build_back_to_main_keyboard())
-                        self.api.answer_callback_query(callback_query["id"], "Учня видалено")
-                    else:
-                        self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
-                    return
-
                 if mode == "question":
                     deleted = self._delete_question(target_id)
                     if deleted:
@@ -2393,108 +1977,50 @@ class QuizBot:
             if user["id"] not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
-
-            target_id_raw = data.split(":", 2)[2]
-            try:
-                target_id_int = int(target_id_raw)
-                target_id = str(target_id_int)
-            except (TypeError, ValueError):
-                target_id_int = None
-                target_id = target_id_raw
-
-            if target_id_int is not None and target_id_int in self.admin_user_ids:
-                self.api.answer_callback_query(callback_query["id"], "Неможливо блокувати адміністратора")
-                return
-
+            target_id = data.split(":", 2)[2]
             target_student = self.students.get(target_id)
-            if not target_student:
-                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
-                return
-
-            target_student.status = "blocked"
-            # stop active test for this student
-            target_student.current_test = []
-            target_student.current_index = 0
-            target_student.current_question_id = None
-            target_student.current_question_message_id = None
-            print(f"[admin] block student target_id={target_id} -> current_question_id=None")
-            self._persist_students()
-            self._show_student_details(chat_id, target_student)
+            if target_student:
+                target_student.status = "blocked"
+                self._persist_students()
+                self._show_student_details(chat_id, target_student)
             self.api.answer_callback_query(callback_query["id"], "Учня заблоковано")
             return
         if data.startswith("student:delete:"):
             if user["id"] not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
-
-            target_id_raw = data.split(":", 2)[2]
-            try:
-                target_id = str(int(target_id_raw))
-            except (TypeError, ValueError):
-                target_id = target_id_raw
-
-            print(f"[debug] student:delete clicked target_id={target_id} (raw={target_id_raw})")
+            target_id = data.split(":", 2)[2]
             target_student = self.students.get(target_id)
-            if not target_student:
-                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
-                return
-
-            # Don't allow deleting an admin account.
-            try:
-                target_id_int = int(target_id)
-            except (TypeError, ValueError):
-                target_id_int = None
-
-            self.api.send_message(
-                chat_id,
-                f"Видалити учня «{target_student.full_name or 'без імені'}» (ID: {target_student.user_id})?",
-                reply_markup={
-                    "inline_keyboard": [
-                        [{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:student:{target_id}"}],
-                        [{"text": "Ні", "callback_data": f"student:view:{target_id}"}],
-                    ]
-                },
-            )
+            if target_student:
+                self.api.send_message(
+                    chat_id,
+                    f"Видалити учня «{target_student.full_name or 'без імені'}» (ID: {target_student.user_id})?",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:student:{target_id}"}],
+                            [{"text": "Ні", "callback_data": f"student:view:{target_id}"}],
+                        ]
+                    },
+                )
             self.api.answer_callback_query(callback_query["id"], "")
             return
-
         if data.startswith("admin:confirm_delete:student:"):
             if user["id"] not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
-
-            target_id_raw = data.split(":", 3)[3]
-            try:
-                target_id = str(int(target_id_raw))
-                target_id_int = int(target_id)
-            except (TypeError, ValueError):
-                self.api.answer_callback_query(callback_query["id"], "Некоректний ID")
-                return
-
+            target_id = data.split(":", 3)[3]
             target_student = self.students.get(target_id)
             if target_student and target_id in self.students:
-                print(f"[debug] admin confirm delete student clicked target_id={target_id} (int={target_id_int})")
-                self.deleted_student_keys.add(target_id)
-                self._persist_state()
                 del self.students[target_id]
-                self.sessions_store.delete_student(target_id_int)
-                self.results_store.delete_student_history(target_id_int)
+                self.sessions_store.delete_student(int(target_id))
                 self._persist_students()
                 self.api.send_message(chat_id, "Учня видалено.", reply_markup=self._build_back_to_main_keyboard())
-                self.api.answer_callback_query(callback_query["id"], "Учня видалено")
-                return
-
-            self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+            self.api.answer_callback_query(callback_query["id"], "Учня видалено")
             return
         if data.startswith("answer:"):
             if not student.current_question_id:
                 self.api.answer_callback_query(callback_query["id"], "Немає активного питання")
                 return
-
-            if student.status != "approved" and user["id"] not in self.admin_user_ids:
-                self.api.answer_callback_query(callback_query["id"], "Анкета заблокована або не схвалена")
-                return
-
             if self._time_is_up(student):
                 self._finish_test_due_to_timeout(student)
                 self.api.answer_callback_query(callback_query["id"], "Час вийшов")
@@ -2693,7 +2219,7 @@ class QuizBot:
         if user["id"] not in self.admin_user_ids:
             return
         if text.startswith("/students"):
-            self.api.send_message(chat["id"], "🏆 Рейтинг учнів", reply_markup=self._build_students_keyboard())
+            self.api.send_message(chat["id"], "👥 Список учнів:", reply_markup=self._build_students_keyboard())
         elif text.startswith("/approve"):
             parts = text.split()
             if len(parts) != 2:
