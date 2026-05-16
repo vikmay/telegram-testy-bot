@@ -558,11 +558,32 @@ class QuizBot:
         except (TypeError, ValueError):
             return DEFAULT_TEST_DURATION_SECONDS
 
+
     def _persist_state(self):
+        # Merge with what is already stored on disk to avoid losing tombstones.
+        # This is important because different actions can call _persist_state()
+        # at different times.
+        try:
+            existing = self.state_store.load() or {}
+        except Exception:
+            existing = {}
+
+        existing_deleted = existing.get("deleted_student_keys", [])
+        existing_set: Set[str] = (
+            {str(k) for k in existing_deleted} if isinstance(existing_deleted, list) else set()
+        )
+
+        current_deleted = getattr(self, "deleted_student_keys", set())
+        current_set: Set[str] = (
+            {str(k) for k in current_deleted} if isinstance(current_deleted, (set, list)) else set()
+        )
+
+        merged = sorted(existing_set | current_set)
+
         self.state_store.save(
             {
                 "test_duration_seconds": self.test_duration_seconds,
-                "deleted_student_keys": sorted(getattr(self, "deleted_student_keys", set())),
+                "deleted_student_keys": merged,
             }
         )
 
@@ -1072,7 +1093,17 @@ class QuizBot:
     def _get_student(self, user_id: int, chat_id: int) -> StudentState:
         key = self._student_key(user_id)
         if key in getattr(self, "deleted_student_keys", set()):
-            # Tombstone: don't recreate in-memory students after admin delete.
+            # Tombstone: don't recreate in-memory students after delete.
+            # But admins must stay usable: otherwise they get stuck at /start with
+            # "Твоя анкета ще не схвалена...".
+            if user_id in getattr(self, "admin_user_ids", set()):
+                return StudentState(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    status="pending_approval",
+                    full_name=f"Учень {user_id}",
+                )
+
             # Use a non-empty label so admin lists/cards don't show "без імені".
             return StudentState(
                 user_id=user_id,
@@ -1287,13 +1318,20 @@ class QuizBot:
 
     def _build_students_keyboard(self):
         # Modern compact ranking (Duolingo/Quizizz style)
+        keyboard_rows = []
+        used_stats_service = False
         try:
             students_for_ranking = {
                 k: s
                 for k, s in self.students.items()
                 if getattr(s, "status", "new") != "deleted" and str(getattr(s, "user_id")) not in self.deleted_student_keys
             }
-            keyboard_rows = self.stats_service.build_students_ranking_buttons(students_for_ranking)
+            ranking_payload = self.stats_service.build_students_ranking_buttons(students_for_ranking.values())
+            if isinstance(ranking_payload, dict):
+                keyboard_rows = ranking_payload.get("inline_keyboard", []) or []
+            elif isinstance(ranking_payload, list):
+                keyboard_rows = ranking_payload
+            used_stats_service = True
         except Exception:
             # Fallback to legacy list (must never break admin UI)
             keyboard_rows = []
@@ -1311,7 +1349,10 @@ class QuizBot:
                 )
                 keyboard_rows.append([{"text": name_label, "callback_data": f"student:view:{student.user_id}"}])
 
-        keyboard_rows.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
+        # StatsService.build_students_ranking_buttons() already includes main menu row.
+        if not used_stats_service:
+            keyboard_rows.append([{"text": "🏠 Головне меню", "callback_data": "main_menu"}])
+
         return {"inline_keyboard": keyboard_rows}
 
     def _show_student_details(self, chat_id: int, student: StudentState):
@@ -1425,7 +1466,20 @@ class QuizBot:
     def _handle_start(self, message: dict):
         chat = message["chat"]
         user = message["from"]
-        student = self._get_student(user["id"], chat["id"])
+        user_id = user["id"]
+
+        # If admin was deleted "as student", let them register again:
+        # remove tombstone on /start and switch deleted->new.
+        key = self._student_key(user_id)
+        if user_id in self.admin_user_ids and key in getattr(self, "deleted_student_keys", set()):
+            self.deleted_student_keys.remove(key)
+            self._persist_state()
+
+        student = self._get_student(user_id, chat["id"])
+
+        if user_id in self.admin_user_ids and student.status == "deleted":
+            student.status = "new"
+
         if student.status == "new":
             student.awaiting_name = True
             student.status = "awaiting_name"
@@ -1836,8 +1890,9 @@ class QuizBot:
         student.matching_pairs = {}
         student.matching_selected_left = None
 
-        # Guard: не дозволяємо стартувати тест, якщо студент заблокований/не схвалений
-        if student.status != "approved" and student.user_id not in self.admin_user_ids:
+        # Guard: не дозволяємо стартувати тест, якщо студент не схвалений
+        # (без винятків для адмінів — адмін має пройти реєстрацію як учень)
+        if student.status != "approved":
             student.current_test = []
             student.current_index = 0
             student.current_question_id = None
@@ -2249,9 +2304,17 @@ class QuizBot:
 
                     target_student = self.students.get(target_id)
                     if target_student and target_id in self.students:
-                        del self.students[target_id]
+                        # Soft-delete to prevent admin IDs from being recreated in-memory.
+                        self.deleted_student_keys.add(target_id)
+                        self._persist_state()
+
+                        target_student.status = "deleted"
+                        target_student.full_name = target_student.full_name or f"Учень {target_student.user_id}"
+
+                        # Cleanup external storage (so it won't come back after restart)
                         self.sessions_store.delete_student(target_id_int)
                         self.results_store.delete_student_history(target_id_int)
+
                         self._persist_students()
                         self.api.send_message(chat_id, "Учня видалено.", reply_markup=self._build_back_to_main_keyboard())
                         self.api.answer_callback_query(callback_query["id"], "Учня видалено")
@@ -2402,9 +2465,7 @@ class QuizBot:
                 target_id_int = None
                 target_id = target_id_raw
 
-            if target_id_int is not None and target_id_int in self.admin_user_ids:
-                self.api.answer_callback_query(callback_query["id"], "Неможливо блокувати адміністратора")
-                return
+            # allow blocking even other admins
 
             target_student = self.students.get(target_id)
             if not target_student:
@@ -2474,24 +2535,28 @@ class QuizBot:
             target_student = self.students.get(target_id)
             if target_student and target_id in self.students:
                 print(f"[debug] admin confirm delete student clicked target_id={target_id} (int={target_id_int})")
+                # Soft-delete: keep record in-memory (and in students.json filtered by status),
+                # so admin IDs won't get recreated by _get_student() auto-approve logic.
                 self.deleted_student_keys.add(target_id)
                 self._persist_state()
-                del self.students[target_id]
+
+                target_student.status = "deleted"
+                target_student.full_name = target_student.full_name or f"Учень {target_student.user_id}"
+
+                # Cleanup external storage (so it won't come back after restart)
                 self.sessions_store.delete_student(target_id_int)
                 self.results_store.delete_student_history(target_id_int)
+
                 self._persist_students()
                 self.api.send_message(chat_id, "Учня видалено.", reply_markup=self._build_back_to_main_keyboard())
                 self.api.answer_callback_query(callback_query["id"], "Учня видалено")
                 return
-
-            self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
-            return
         if data.startswith("answer:"):
             if not student.current_question_id:
                 self.api.answer_callback_query(callback_query["id"], "Немає активного питання")
                 return
 
-            if student.status != "approved" and user["id"] not in self.admin_user_ids:
+            if student.status != "approved":
                 self.api.answer_callback_query(callback_query["id"], "Анкета заблокована або не схвалена")
                 return
 
@@ -2743,7 +2808,7 @@ class QuizBot:
             if text.startswith("/menu"):
                 if student.status == "new":
                     self.api.send_message(message["chat"]["id"], "Спочатку натисни /start один раз.")
-                elif student.status == "approved" or message["from"]["id"] in self.admin_user_ids:
+                elif student.status == "approved":
                     self._show_main_menu(message["chat"]["id"], message["from"]["id"])
                 else:
                     self.api.send_message(message["chat"]["id"], "Твоя анкета ще не схвалена адміністрацією.")
