@@ -10,12 +10,13 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
-            - name: Deploy to VM via SSH (git fetch/reset + systemd restart)
+            - name: Deploy to VM via SSH
               uses: appleboy/ssh-action@v1.0.0
               with:
                   host: ${{ secrets.VM_HOST }}
                   username: ${{ secrets.VM_USER }}
                   key: ${{ secrets.VM_SSH_KEY }}
+
                   script: |
                       set -euo pipefail
 
@@ -23,99 +24,118 @@ jobs:
                       SERVICE_NAME="telegram-testy-bot"
                       BRANCH="main"
 
-                      # Ensure deploy key exists for GitHub access
                       mkdir -p "$HOME/.ssh"
+
                       DEPLOY_KEY_PATH="$HOME/.ssh/deploy_key"
+
                       echo "${{ secrets.DEPLOY_KEY }}" > "$DEPLOY_KEY_PATH"
+
                       chmod 600 "$DEPLOY_KEY_PATH"
 
-                      # Add github.com to known_hosts to avoid interactive prompt
                       ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
 
                       export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
 
-                      # Move to repo directory
                       mkdir -p "$REPO_DIR"
-                      cd "$REPO_DIR"
 
-                      # Always preserve token.txt (bot requires it to start)
-                      TOKEN_BAK_DIR="$HOME/.deploy_token_backup_${SERVICE_NAME}_$$"
-                      TOKEN_BAK_PATH="$TOKEN_BAK_DIR/token.txt"
-                      mkdir -p "$TOKEN_BAK_DIR"
-                      if [ -f "$REPO_DIR/token.txt" ]; then
-                        cp "$REPO_DIR/token.txt" "$TOKEN_BAK_PATH"
-                      fi
+                      # ------------------------------------------------------------------
+                      # FIRST DEPLOY
+                      # ------------------------------------------------------------------
 
-                      # If token.txt is missing (it is required), restore from GitHub secret
-                      if [ ! -f "$REPO_DIR/token.txt" ] && [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
-                        echo "${{ secrets.TELEGRAM_BOT_TOKEN }}" > "$REPO_DIR/token.txt"
-                        chmod 600 "$REPO_DIR/token.txt" || true
-                      fi
-
-                      if [ ! -d ".git" ]; then
-                        echo "No .git directory found. Cloning fresh repo (will preserve token.txt / venv / *.db)..."
-
-                        # Preserve local secrets and state
-                        BACKUP_DIR="$HOME/.deploy_backup_${SERVICE_NAME}_$$"
-                        mkdir -p "$BACKUP_DIR/db"
-
-                        TOKEN_BAK="$BACKUP_DIR/token.txt"
-                        VENV_BAK="$BACKUP_DIR/venv"
-                        DB_BAK_DIR="$BACKUP_DIR/db"
-
-                        if [ -f "${REPO_DIR}/token.txt" ]; then cp "${REPO_DIR}/token.txt" "$TOKEN_BAK"; fi
-                        if [ -d "${REPO_DIR}/venv" ]; then mv "${REPO_DIR}/venv" "$VENV_BAK"; fi
-
-                        for f in "${REPO_DIR}"/*.db; do
-                          [ -e "$f" ] || continue
-                          mv "$f" "$DB_BAK_DIR/"
-                        done
+                      if [ ! -d "$REPO_DIR/.git" ]; then
+                        echo "Fresh clone..."
 
                         rm -rf "$REPO_DIR"
 
-                        git clone --depth 1 --branch "$BRANCH" "${{ secrets.REPO_SSH_URL }}" "$REPO_DIR"
-
-                        # Restore preserved items
-                        if [ -f "$TOKEN_BAK" ]; then
-                          cp "$TOKEN_BAK" "${REPO_DIR}/token.txt"
-                          chmod 600 "${REPO_DIR}/token.txt" || true
-                        fi
-                        if [ -d "$VENV_BAK" ]; then mv "$VENV_BAK" "${REPO_DIR}/venv"; fi
-                        if [ -n "$(ls -A "$DB_BAK_DIR" 2>/dev/null)" ]; then mv "$DB_BAK_DIR"/*.db "${REPO_DIR}/"; fi
-                        rm -rf "$BACKUP_DIR"
-
-                        cd "$REPO_DIR"
-                      else
-                        # Fetch and hard-reset working tree to match remote branch
-                        git fetch --prune origin "$BRANCH"
-
-                        # Important: if this VM repo was initialized manually before cloning,
-                        # there may be untracked files that block checkout.
-                        # Clean untracked files that can block checkout, but preserve local runtime:
-                        # - token.txt
-                        # - venv/
-                        # - *.db
-                        # - data/state.json (ignored state)
-                        git clean -fd -e token.txt -e venv -e "*.db" -e "data/state.json"
-
-                        git checkout -B "$BRANCH" "origin/$BRANCH"
-                        git reset --hard "origin/$BRANCH"
+                        git clone \
+                          --depth 1 \
+                          --branch "$BRANCH" \
+                          "${{ secrets.REPO_SSH_URL }}" \
+                          "$REPO_DIR"
                       fi
 
-                      # Final safeguard: if token.txt disappeared for any reason, restore from backup
-                      if [ ! -f "$REPO_DIR/token.txt" ] && [ -f "$TOKEN_BAK_PATH" ]; then
-                        cp "$TOKEN_BAK_PATH" "$REPO_DIR/token.txt"
-                        chmod 600 "$REPO_DIR/token.txt" || true
+                      cd "$REPO_DIR"
+
+                      # ------------------------------------------------------------------
+                      # TOKEN SAFETY
+                      # ------------------------------------------------------------------
+
+                      if [ ! -f token.txt ] && [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+                        echo "${{ secrets.TELEGRAM_BOT_TOKEN }}" > token.txt
+                        chmod 600 token.txt || true
                       fi
 
-                      # Ensure venv exists (systemd ExecStart uses venv/bin/python)
+                      # ------------------------------------------------------------------
+                      # PRESERVE LOCAL JSON FILES
+                      # ------------------------------------------------------------------
+
+                      QUESTIONS_BAK="$(mktemp)"
+                      TOPICS_BAK="$(mktemp)"
+
+                      if [ -f data/questions.json ]; then
+                        cp data/questions.json "$QUESTIONS_BAK"
+                      fi
+
+                      if [ -f data/topics.json ]; then
+                        cp data/topics.json "$TOPICS_BAK"
+                      fi
+
+                      # ------------------------------------------------------------------
+                      # UPDATE REPO
+                      # ------------------------------------------------------------------
+
+                      git fetch --prune origin "$BRANCH"
+
+                      # force sync with remote
+                      git reset --hard "origin/$BRANCH"
+
+                      # clean untracked files but preserve runtime data
+                      git clean -fd \
+                        -e token.txt \
+                        -e venv \
+                        -e "*.db" \
+                        -e "data/state.json"
+
+                      # ------------------------------------------------------------------
+                      # RESTORE LOCAL JSON FILES
+                      # ------------------------------------------------------------------
+
+                      mkdir -p data
+
+                      if [ -s "$QUESTIONS_BAK" ]; then
+                        cp "$QUESTIONS_BAK" data/questions.json
+                      fi
+
+                      if [ -s "$TOPICS_BAK" ]; then
+                        cp "$TOPICS_BAK" data/topics.json
+                      fi
+
+                      rm -f "$QUESTIONS_BAK" "$TOPICS_BAK"
+
+                      # ------------------------------------------------------------------
+                      # PYTHON VENV
+                      # ------------------------------------------------------------------
+
                       if [ ! -x "$REPO_DIR/venv/bin/python" ]; then
-                        echo "venv/bin/python not found. Creating venv at $REPO_DIR/venv ..."
+                        echo "Creating venv..."
+
                         sudo -H python3 -m venv "$REPO_DIR/venv"
                       fi
 
+                      # ------------------------------------------------------------------
+                      # INSTALL DEPENDENCIES
+                      # ------------------------------------------------------------------
+
+                      if [ -f requirements.txt ]; then
+                        "$REPO_DIR/venv/bin/pip" install -r requirements.txt
+                      fi
+
+                      # ------------------------------------------------------------------
+                      # RESTART SERVICE
+                      # ------------------------------------------------------------------
+
                       echo "Restarting service: $SERVICE_NAME"
+
                       sudo systemctl restart "$SERVICE_NAME"
 
-                      # Cleanup token backup dir
-                      rm -rf "$TOKEN_BAK_DIR" 2>/dev/null || true
+                      echo "Deploy complete"
