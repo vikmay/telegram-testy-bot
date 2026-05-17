@@ -2413,10 +2413,16 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"])
                 return
             if action == "cancel_delete":
+                prev_mode = student.delete_action_mode
                 student.awaiting_delete_action = False
                 student.delete_action_mode = None
                 student.delete_action_source = None
                 self._persist_students()
+
+                # Navigation fix: return to correct admin menu depending on what was being deleted
+                if prev_mode in {"topic", "topic_questions", "purge_topic"}:
+                    self._show_admin_topics_menu(chat_id)
+
                 self.api.answer_callback_query(callback_query["id"], "Скасовано")
                 return
             if action.startswith("confirm_delete:"):
@@ -2482,19 +2488,40 @@ class QuizBot:
                 if student.delete_action_mode == "topic" and mode == "topic" and student.delete_action_source == target_id:
                     resolved_topic_id = self._resolve_topic_id(target_id)
                     topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
+
+                    deleted = False
+                    questions_count = self._topic_question_count(resolved_topic_id) if resolved_topic_id else 0
+
                     if topic:
-                        if self._topic_question_count(resolved_topic_id) > 0:
-                            self.api.send_message(chat_id, "Тему не можна видалити, поки в ній є питання. Спочатку видали або перенеси питання.")
+                        if questions_count > 0:
+                            self.api.send_message(
+                                chat_id,
+                                "Тему не можна видалити, поки в ній є питання. Спочатку видали питання.",
+                            )
                             self._show_admin_topics_menu(chat_id)
                             self.api.answer_callback_query(callback_query["id"], "Є питання")
-                        else:
-                            deleted = self._delete_topic(resolved_topic_id)
-                            if deleted:
-                                self.api.send_message(chat_id, "Тему видалено.")
-                                self._show_admin_topics_menu(chat_id)
-                            self.api.answer_callback_query(callback_query["id"], "Тему видалено" if deleted else "Не знайдено")
+
+                            student.awaiting_delete_action = False
+                            student.delete_action_mode = None
+                            student.delete_action_source = None
+                            self._persist_students()
+                            return
+
+                        deleted = self._delete_topic(resolved_topic_id)
+                        if deleted:
+                            self.api.send_message(chat_id, "Тему видалено.")
+                            self._show_admin_topics_menu(chat_id)
+
+                        self.api.answer_callback_query(callback_query["id"], "Тему видалено" if deleted else "Не знайдено")
                     else:
                         self.api.answer_callback_query(callback_query["id"], "Не знайдено")
+
+                    student.awaiting_delete_action = False
+                    student.delete_action_mode = None
+                    student.delete_action_source = None
+                    self._persist_students()
+                    return
+
                 elif student.delete_action_mode == "purge_topic" and mode == "purge_topic" and student.delete_action_source == target_id:
                     resolved_topic_id = self._resolve_topic_id(target_id)
                     topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
