@@ -1898,7 +1898,7 @@ class QuizBot:
             student.current_question_id = None
             student.current_question_message_id = None
             self._persist_students()
-            self.api.send_message(student.chat_id, "Анкета заблокована або не схвалена.")
+            self.api.send_message(student.chat_id, "Анкета відсутня, заблокована або не схвалена.")
             return
 
         # Resolve topic_id safely:
