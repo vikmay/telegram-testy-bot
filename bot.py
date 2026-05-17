@@ -974,9 +974,6 @@ class QuizBot:
                 user_id_int = int(key)
             except (TypeError, ValueError):
                 user_id_int = None
-            if user_id_int is not None and user_id_int in self.admin_user_ids:
-                continue
-
             normalized_row = dict(row)
             legacy_selected_topics = normalized_row.pop("selected_topics", None)
             legacy_current_test_topic = normalized_row.pop("current_test_topic", None)
@@ -997,9 +994,6 @@ class QuizBot:
                 user_id_int = int(key)
             except (TypeError, ValueError):
                 user_id_int = None
-            if user_id_int is not None and user_id_int in self.admin_user_ids:
-                continue
-
             student = self.students.get(key)
             if not student:
                 continue
@@ -1064,9 +1058,6 @@ class QuizBot:
     def _persist_students(self):
         payload = {}
         for key, state in self.students.items():
-            # Admins must not be persisted as "students".
-            if state.user_id in self.admin_user_ids:
-                continue
             # Tombstone placeholder: don't persist deleted records.
             if state.status == "deleted":
                 continue
@@ -1480,11 +1471,16 @@ class QuizBot:
         if user_id in self.admin_user_ids and student.status == "deleted":
             student.status = "new"
 
-        if student.status == "new":
+        if student.status in {"new", "awaiting_name"}:
+            # Restart onboarding: clear possibly stale names from previous partial state.
+            student.last_name = ""
+            student.first_name = ""
+            student.full_name = ""
+
             student.awaiting_name = True
             student.status = "awaiting_name"
             self._persist_students()
-            self.api.send_message(chat["id"], "Введи ім'я та прізвище одним повідомленням.")
+            self.api.send_message(chat["id"], "Введи прізвище.")
             return
         if student.status != "approved":
             self.api.send_message(chat["id"], "Твоя анкета ще не схвалена адміністрацією.")
@@ -1536,13 +1532,27 @@ class QuizBot:
             return
 
         if student.awaiting_name:
-            parts = text.split()
-            if len(parts) < 2:
-                self.api.send_message(chat["id"], "Потрібно вказати ім'я та прізвище.")
+            # If user sends a command like /start while onboarding expects a name,
+            # don't treat it as a surname and don't persist it.
+            if text.startswith("/"):
+                self.api.send_message(chat["id"], "Команда не може бути назвою. Введи прізвище.")
                 return
-            student.first_name = parts[0]
-            student.last_name = " ".join(parts[1:])
-            student.full_name = text
+
+            cleaned = " ".join(text.split())
+            if not cleaned:
+                self.api.send_message(chat["id"], "Введи текст.")
+                return
+
+            # Step 1 (surname)
+            if not student.last_name:
+                student.last_name = " ".join(word.capitalize() for word in cleaned.split())
+                self._persist_students()
+                self.api.send_message(chat["id"], "Введи ім'я.")
+                return
+
+            # Step 2 (given name)
+            student.first_name = " ".join(word.capitalize() for word in cleaned.split())
+            student.full_name = f"{student.last_name} {student.first_name}".strip()
             student.awaiting_name = False
             if user["id"] in self.admin_user_ids:
                 student.status = "approved"
