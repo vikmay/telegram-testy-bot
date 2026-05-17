@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.db
+*.json
 
 # Secrets
 token.txt
@@ -11,8 +12,7 @@ token.txt
 .env.*
 
 # Local data/state
-data/students.json
-data/state.json
+data/*.json
 data/*.db
 
 # OS/editor
