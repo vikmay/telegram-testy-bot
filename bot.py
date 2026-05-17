@@ -1295,7 +1295,7 @@ class QuizBot:
         return {"inline_keyboard": keyboard}
 
     def _build_admin_keyboard(self):
-        return {"inline_keyboard": [[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -1 хв", "callback_data": "admin:time:-60"}, {"text": "⏱ +1 хв", "callback_data": "admin:time:+60"}], [{"text": "⏱ -10 с", "callback_data": "admin:time:-10"}, {"text": "⏱ +10 с", "callback_data": "admin:time:+10"}], [{"text": "📥 Імпорт DOCX", "callback_data": "admin:importdocx"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]]}
+        return {"inline_keyboard": [[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -30 с", "callback_data": "admin:time:-30"}, {"text": "⏱ +30 с", "callback_data": "admin:time:+30"}], [{"text": "📥 Імпорт DOCX", "callback_data": "admin:importdocx"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]]}
 
     def _show_admin_topics_menu(self, chat_id: int):
         keyboard = []
@@ -1441,7 +1441,7 @@ class QuizBot:
     def _build_main_menu_keyboard(self, is_admin: bool):
         keyboard = []
         if is_admin:
-            keyboard.extend([[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -1 хв", "callback_data": "admin:time:-60"}, {"text": "⏱ +1 хв", "callback_data": "admin:time:+60"}], [{"text": "⏱ -10 с", "callback_data": "admin:time:-10"}, {"text": "⏱ +10 с", "callback_data": "admin:time:+10"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]])
+            keyboard.extend([[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -30 с", "callback_data": "admin:time:-30"}, {"text": "⏱ +30 с", "callback_data": "admin:time:+30"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]])
         keyboard.append([{"text": "📚 Пройти Тести", "callback_data": "back_to_topics"}])
         return {"inline_keyboard": keyboard}
 
@@ -2181,7 +2181,7 @@ class QuizBot:
                     self.api.send_message(chat_id, f"Поточний час тесту: {self._format_duration(self.test_duration_seconds)}.")
                     self.api.answer_callback_query(callback_query["id"], "Показано час")
                     return
-                deltas = {"-60": -60, "+60": 60, "-10": -10, "+10": 10}
+                deltas = {"-30": -30, "+30": 30}
                 if time_action not in deltas:
                     self.api.answer_callback_query(callback_query["id"], "Невідома дія")
                     return
