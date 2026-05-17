@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import random
@@ -655,6 +656,31 @@ class QuizBot:
         slug = re.sub(r"[^a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ]+", "-", name.strip().lower()).strip("-")
         return slug or f"topic-{random.randint(1000, 9999)}"
 
+    def _topic_ref(self, topic_id: str) -> str:
+        """
+        Short deterministic reference for topic_id so Telegram callback_data stays within limits.
+        """
+        digest = hashlib.sha1(topic_id.encode("utf-8")).hexdigest()
+        return digest[:10]
+
+    def _topic_id_from_ref(self, topic_ref: str) -> Optional[str]:
+        """
+        Resolve a short topic_ref back to full topic_id by scanning active topics.
+        """
+        for topic in self.topics:
+            if self._topic_ref(topic.id) == topic_ref:
+                return topic.id
+        return None
+
+    def _resolve_topic_id(self, topic_id_or_ref: str) -> Optional[str]:
+        """
+        Accept either full topic_id (legacy/other flows) or short topic ref
+        (admin inline callbacks) and always return full topic_id.
+        """
+        if self._topic_by_id(topic_id_or_ref):
+            return topic_id_or_ref
+        return self._topic_id_from_ref(topic_id_or_ref)
+
     def _load_topics(self) -> List[Topic]:
         raw = self.topics_store.load()
         topics: List[Topic] = []
@@ -1085,23 +1111,19 @@ class QuizBot:
         key = self._student_key(user_id)
         if key in getattr(self, "deleted_student_keys", set()):
             # Tombstone: don't recreate in-memory students after delete.
-            # But admins must stay usable: otherwise they get stuck at /start with
-            # "Твоя анкета ще не схвалена...".
+            # For admins, we *clear* the tombstone so they remain fully usable
+            # (e.g. DOCX import + topic/question delete).
             if user_id in getattr(self, "admin_user_ids", set()):
+                self.deleted_student_keys.remove(key)
+                self._persist_state()
+            else:
+                # Use a non-empty label so admin lists/cards don't show "Р±РµР· С–РјРµРЅС–".
                 return StudentState(
                     user_id=user_id,
                     chat_id=chat_id,
-                    status="pending_approval",
-                    full_name=f"Учень {user_id}",
+                    status="deleted",
+                    full_name=f"РЈС‡РµРЅСЊ {user_id}",
                 )
-
-            # Use a non-empty label so admin lists/cards don't show "без імені".
-            return StudentState(
-                user_id=user_id,
-                chat_id=chat_id,
-                status="deleted",
-                full_name=f"Учень {user_id}",
-            )
 
         if key not in self.students:
             self.students[key] = StudentState(user_id=user_id, chat_id=chat_id)
@@ -1293,14 +1315,14 @@ class QuizBot:
         for topic in self.topics:
             if topic.active:
                 keyboard.append([
-                    {"text": f"✏️ {topic.name}", "callback_data": f"admin:topic:edit:{topic.id}"},
-                    {"text": "Видалити тему", "callback_data": f"admin:topic:delete:{topic.id}"},
-                    {"text": "🗑 Усі питання", "callback_data": f"admin:topic:delete_questions:{topic.id}"},
+                    {"text": f"✏️ {topic.name}", "callback_data": f"admin:topic:edit:{self._topic_ref(topic.id)}"},
+                    {"text": "Видалити тему", "callback_data": f"admin:topic:delete:{self._topic_ref(topic.id)}"},
+                    {"text": "🗑 Усі питання", "callback_data": f"admin:topic:delete_questions:{self._topic_ref(topic.id)}"},
                 ])
             else:
                 keyboard.append([
-                    {"text": f"♻️ {topic.name} (вимкнена)", "callback_data": f"admin:topic:restore:{topic.id}"},
-                    {"text": "🗑 Видалити тему", "callback_data": f"admin:topic:purge:{topic.id}"},
+                    {"text": f"♻️ {topic.name} (вимкнена)", "callback_data": f"admin:topic:restore:{self._topic_ref(topic.id)}"},
+                    {"text": "🗑 Видалити тему", "callback_data": f"admin:topic:purge:{self._topic_ref(topic.id)}"},
                 ])
         keyboard.append([{"text": "➕ Додати тему", "callback_data": "topic:add"}])
         keyboard.append([{"text": "📥 Імпорт питань у тему", "callback_data": "admin:importdocx"}])
@@ -1468,6 +1490,18 @@ class QuizBot:
 
         student = self._get_student(user_id, chat["id"])
 
+        # /start should reset any "awaiting ..." admin workflows,
+        # so we don't end up showing stale "theme not found" messages.
+        student.awaiting_docx_import = False
+        student.awaiting_docx_topic_id = None
+        student.awaiting_topic_action = False
+        student.topic_action_mode = None
+        student.topic_action_source = None
+        student.awaiting_delete_action = False
+        student.delete_action_mode = None
+        student.delete_action_source = None
+        self._persist_students()
+
         if user_id in self.admin_user_ids and student.status == "deleted":
             student.status = "new"
 
@@ -1493,7 +1527,16 @@ class QuizBot:
         text = message.get("text", "").strip()
         student = self._get_student(user["id"], chat["id"])
 
-        if user["id"] in self.admin_user_ids and student.awaiting_topic_action:
+        try:
+            user_id_int = int(user["id"])
+        except (TypeError, ValueError):
+            user_id_int = None
+
+        if text.startswith("/start"):
+            self._handle_start(message)
+            return
+
+        if user_id_int is not None and user_id_int in self.admin_user_ids and student.awaiting_topic_action:
             mode = student.topic_action_mode
             source = student.topic_action_source
 
@@ -1554,12 +1597,12 @@ class QuizBot:
             student.first_name = " ".join(word.capitalize() for word in cleaned.split())
             student.full_name = f"{student.last_name} {student.first_name}".strip()
             student.awaiting_name = False
-            if user["id"] in self.admin_user_ids:
+            if user_id_int is not None and user_id_int in self.admin_user_ids:
                 student.status = "approved"
-                self.api.send_message(chat["id"], "Дані отримано. Ти маєш адмін-доступ.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.send_message(chat["id"], "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РўРёРјР°С”С€ Р°РґРјС–РЅ-РґРѕСЃС‚СѓРї.", reply_markup=self._build_back_to_main_keyboard())
             else:
                 student.status = "pending_approval"
-                self.api.send_message(chat["id"], "Дані отримано. Очікуй схвалення адміністратора.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.send_message(chat["id"], "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РћС‡С–РєСѓР№ СЃС…РІР°Р»РµРЅРЅСЃСЃ Р°РґРјС–РЅС–СЃС‚СЂР°С‚РѕСЂР°.", reply_markup=self._build_back_to_main_keyboard())
             self._persist_students()
             return
 
@@ -2129,16 +2172,23 @@ class QuizBot:
         user = callback_query["from"]
         message = callback_query.get("message")
         if not message:
+            self.api.answer_callback_query(callback_query["id"], "")
             return
         chat_id = message["chat"]["id"]
         data = callback_query.get("data", "")
         student = self._get_student(user["id"], chat_id)
 
         if data.startswith("admin:"):
-            if user["id"] not in self.admin_user_ids:
-                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+            try:
+                user_id_int = int(user["id"])
+            except (TypeError, ValueError):
+                self.api.answer_callback_query(callback_query["id"], "РќРµРјР°С” РР”")
                 return
-            action = data.split(":", 1)[1]
+            is_admin = user_id_int in self.admin_user_ids
+            if user_id_int not in self.admin_user_ids:
+                self.api.answer_callback_query(callback_query["id"], "Р СњР ВµР СР В°РЎвЂќ Р С—РЎР‚Р В°Р Р†")
+                return
+            action = data.split(":", 1)[1].strip()
             if action == "students":
                 self._handle_admin_command({"chat": message["chat"], "from": user, "text": "/students"})
                 self.api.answer_callback_query(callback_query["id"], "Відкрито список учнів")
@@ -2201,7 +2251,11 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Час оновлено")
                 return
             if action == "topics":
-                self._show_admin_topics_menu(chat_id)
+                try:
+                    self._show_admin_topics_menu(chat_id)
+                except Exception as e:
+                    print(f"[ERROR] _show_admin_topics_menu failed: {e}")
+                    raise
                 self.api.answer_callback_query(callback_query["id"], "Відкрито теми")
                 return
             if action == "importdocx":
@@ -2212,38 +2266,57 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Оберіть тему")
                 return
             if action.startswith("topic:edit:"):
-                topic_id = action.split(":", 2)[2]
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                if not resolved_topic_id:
+                    self.api.answer_callback_query(callback_query["id"], "Тему не знайдено")
+                    return
                 student.awaiting_topic_action = True
                 student.topic_action_mode = "rename"
-                student.topic_action_source = topic_id
+                student.topic_action_source = resolved_topic_id
                 self._persist_students()
                 self.api.send_message(chat_id, "Введи нову назву теми одним повідомленням.")
                 self.api.answer_callback_query(callback_query["id"], "Очікую нову назву")
                 return
+
             if action.startswith("topic:delete:"):
-                topic_id = action.split(":", 2)[2]
-                topic = self._topic_by_id(topic_id)
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                 if topic:
                     student.awaiting_delete_action = True
                     student.delete_action_mode = "topic"
-                    student.delete_action_source = topic_id
+                    student.delete_action_source = topic_ref
                     self._persist_students()
-                    self.api.send_message(chat_id, f"Видалити тему «{topic.name}»? Використай кнопку нижче.", reply_markup={"inline_keyboard": [[{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:topic:{topic_id}"}, {"text": "Ні", "callback_data": "admin:cancel_delete"}]]})
+                    self.api.send_message(
+                        chat_id,
+                        f"Видалити тему «{topic.name}»? Використай кнопку нижче.",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:topic:{topic_ref}"}, {"text": "Ні", "callback_data": "admin:cancel_delete"}]
+                            ]
+                        },
+                    )
+                self.api.answer_callback_query(callback_query["id"], "")
                 return
+
             if action.startswith("topic:questions:"):
-                topic_id = action.split(":", 2)[2]
-                topic = self._topic_by_id(topic_id)
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                 if topic:
-                    self.api.send_message(chat_id, f"Питання теми «{topic.name}»:", reply_markup=self._build_questions_keyboard(topic_id))
+                    self.api.send_message(chat_id, f"Питання теми «{topic.name}»:", reply_markup=self._build_questions_keyboard(resolved_topic_id))
                 self.api.answer_callback_query(callback_query["id"], "Відкрито питання теми")
                 return
+
             if action.startswith("topic:delete_questions:"):
-                topic_id = action.split(":", 2)[2]
-                topic = self._topic_by_id(topic_id)
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                 if topic:
                     student.awaiting_delete_action = True
                     student.delete_action_mode = "topic_questions"
-                    student.delete_action_source = topic_id
+                    student.delete_action_source = topic_ref
                     self._persist_students()
                     self.api.send_message(
                         chat_id,
@@ -2251,7 +2324,7 @@ class QuizBot:
                         reply_markup={
                             "inline_keyboard": [
                                 [
-                                    {"text": "Так, видалити", "callback_data": f"admin:confirm_delete:topic_questions:{topic_id}"},
+                                    {"text": "Так, видалити", "callback_data": f"admin:confirm_delete:topic_questions:{topic_ref}"},
                                     {"text": "Ні", "callback_data": "admin:cancel_delete"},
                                 ]
                             ]
@@ -2259,21 +2332,33 @@ class QuizBot:
                     )
                 self.api.answer_callback_query(callback_query["id"], "")
                 return
+
             if action.startswith("topic:purge:"):
-                topic_id = action.split(":", 2)[2]
-                topic = self._topic_by_id(topic_id)
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                 if topic:
                     student.awaiting_delete_action = True
                     student.delete_action_mode = "purge_topic"
-                    student.delete_action_source = topic_id
+                    student.delete_action_source = topic_ref
                     self._persist_students()
-                    self.api.send_message(chat_id, f"Назавжди видалити тему «{topic.name}»? Питання теж буде видалено.", reply_markup={"inline_keyboard": [[{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:purge_topic:{topic_id}"}, {"text": "Ні", "callback_data": "admin:cancel_delete"}]]})
+                    self.api.send_message(
+                        chat_id,
+                        f"Назавжди видалити тему «{topic.name}»? Питання теж буде видалено.",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [{"text": "Так, видалити", "callback_data": f"admin:confirm_delete:purge_topic:{topic_ref}"}, {"text": "Ні", "callback_data": "admin:cancel_delete"}]
+                            ]
+                        },
+                    )
                 self.api.answer_callback_query(callback_query["id"], "")
                 return
+
             if action.startswith("topic:restore:"):
-                topic_id = action.split(":", 2)[2]
-                topic = self._topic_by_id(topic_id)
-                if topic and self._restore_topic(topic_id):
+                topic_ref = action.split(":", 2)[2]
+                resolved_topic_id = self._resolve_topic_id(topic_ref)
+                topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
+                if topic and self._restore_topic(resolved_topic_id):
                     self.api.send_message(chat_id, f"Тему «{topic.name}» увімкнено.")
                     self._show_admin_topics_menu(chat_id)
                 self.api.answer_callback_query(callback_query["id"], "Тему увімкнено")
@@ -2314,9 +2399,10 @@ class QuizBot:
 
                     target_student = self.students.get(target_id)
                     if target_student and target_id in self.students:
-                        # Soft-delete to prevent admin IDs from being recreated in-memory.
-                        self.deleted_student_keys.add(target_id)
-                        self._persist_state()
+                        # Tombstone only for non-admins; admins must stay fully usable for DOCX/import/delete flows.
+                        if target_id not in {str(i) for i in self.admin_user_ids}:
+                            self.deleted_student_keys.add(target_id)
+                            self._persist_state()
 
                         target_student.status = "deleted"
                         target_student.full_name = target_student.full_name or f"Учень {target_student.user_id}"
@@ -2338,17 +2424,18 @@ class QuizBot:
                         self.api.send_message(chat_id, "Питання видалено.")
                         self._show_admin_topics_menu(chat_id)
                     self.api.answer_callback_query(callback_query["id"], "Питання видалено" if deleted else "Не знайдено")
-                    student.awaiting_delete_action = False
-                    student.delete_action_mode = None
-                    student.delete_action_source = None
-                    self._persist_students()
-                    return
+                # Safety: ensure Telegram always gets answerCallbackQuery for confirm_delete callbacks.
+                self.api.answer_callback_query(callback_query["id"], "")
                 if mode == "topic_questions":
                     if not student.awaiting_delete_action or student.delete_action_mode != "topic_questions" or student.delete_action_source != target_id:
                         self.api.answer_callback_query(callback_query["id"], "Немає підтвердження")
                         return
-                    deleted = self._delete_topic_questions(target_id)
-                    topic = self._topic_by_id(target_id)
+                    resolved_topic_id = self._resolve_topic_id(target_id)
+                    if not resolved_topic_id:
+                        self.api.answer_callback_query(callback_query["id"], "Не знайдено")
+                        return
+                    deleted = self._delete_topic_questions(resolved_topic_id)
+                    topic = self._topic_by_id(resolved_topic_id)
                     if topic:
                         self.api.send_message(chat_id, f"Усі питання теми «{topic.name}» видалено.")
                         self._show_admin_topics_menu(chat_id)
@@ -2362,14 +2449,15 @@ class QuizBot:
                     self.api.answer_callback_query(callback_query["id"], "Немає підтвердження")
                     return
                 if student.delete_action_mode == "topic" and mode == "topic" and student.delete_action_source == target_id:
-                    topic = self._topic_by_id(target_id)
+                    resolved_topic_id = self._resolve_topic_id(target_id)
+                    topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                     if topic:
-                        if self._topic_question_count(target_id) > 0:
+                        if self._topic_question_count(resolved_topic_id) > 0:
                             self.api.send_message(chat_id, "Тему не можна видалити, поки в ній є питання. Спочатку видали або перенеси питання.")
                             self._show_admin_topics_menu(chat_id)
                             self.api.answer_callback_query(callback_query["id"], "Є питання")
                         else:
-                            deleted = self._delete_topic(target_id)
+                            deleted = self._delete_topic(resolved_topic_id)
                             if deleted:
                                 self.api.send_message(chat_id, "Тему видалено.")
                                 self._show_admin_topics_menu(chat_id)
@@ -2377,11 +2465,12 @@ class QuizBot:
                     else:
                         self.api.answer_callback_query(callback_query["id"], "Не знайдено")
                 elif student.delete_action_mode == "purge_topic" and mode == "purge_topic" and student.delete_action_source == target_id:
-                    topic = self._topic_by_id(target_id)
+                    resolved_topic_id = self._resolve_topic_id(target_id)
+                    topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
                     if topic:
-                        self.questions = [question for question in self.questions if question.topic_id != target_id]
+                        self.questions = [question for question in self.questions if question.topic_id != resolved_topic_id]
                         self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
-                        deleted = self._delete_topic(target_id)
+                        deleted = self._delete_topic(resolved_topic_id)
                         if deleted:
                             self.api.send_message(chat_id, "Тему та всі питання в ній видалено.")
                             self._show_admin_topics_menu(chat_id)
@@ -2401,7 +2490,12 @@ class QuizBot:
             self.api.answer_callback_query(callback_query["id"], "Відкрито список тем")
             return
         if data.startswith("import_topic:"):
-            if user["id"] not in self.admin_user_ids:
+            try:
+                user_id_int = int(user["id"])
+            except (TypeError, ValueError):
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+            if user_id_int not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
             topic_id = data.split(":", 1)[1]
@@ -2416,7 +2510,12 @@ class QuizBot:
             self.api.answer_callback_query(callback_query["id"], f"Очікую DOCX для {topic.name}")
             return
         if data == "topic:add":
-            if user["id"] not in self.admin_user_ids:
+            try:
+                user_id_int = int(user["id"])
+            except (TypeError, ValueError):
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+            if user_id_int not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
             student.awaiting_topic_action = True
@@ -2439,7 +2538,12 @@ class QuizBot:
             self.api.answer_callback_query(callback_query["id"], "Тест перезапущено")
             return
         if data.startswith("student:view:"):
-            if user["id"] not in self.admin_user_ids:
+            try:
+                user_id_int = int(user["id"])
+            except (TypeError, ValueError):
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+            if user_id_int not in self.admin_user_ids:
                 self.api.answer_callback_query(callback_query["id"], "Немає прав")
                 return
             target_id = data.split(":", 2)[2]
@@ -2805,13 +2909,13 @@ class QuizBot:
             if message.get("document"):
                 self._handle_document(message)
                 return
-            text = message.get("text", "")
+            text = message.get("text", "").strip()
             student = self._get_student(message["from"]["id"], message["chat"]["id"])
-            if student.awaiting_topic_action or student.awaiting_name or student.awaiting_docx_topic_id:
-                self._handle_text(message)
-                return
             if text.startswith("/start"):
                 self._handle_start(message)
+                return
+            if student.awaiting_topic_action or student.awaiting_name or student.awaiting_docx_topic_id:
+                self._handle_text(message)
                 return
             if text.startswith("/menu"):
                 if student.status == "new":
