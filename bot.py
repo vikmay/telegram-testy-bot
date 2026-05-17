@@ -2504,7 +2504,6 @@ class QuizBot:
             except (TypeError, ValueError):
                 target_id = target_id_raw
 
-            print(f"[debug] student:delete clicked target_id={target_id} (raw={target_id_raw})")
             target_student = self.students.get(target_id)
             if not target_student:
                 self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
@@ -2544,7 +2543,6 @@ class QuizBot:
 
             target_student = self.students.get(target_id)
             if target_student and target_id in self.students:
-                print(f"[debug] admin confirm delete student clicked target_id={target_id} (int={target_id_int})")
                 # Soft-delete: keep record in-memory (and in students.json filtered by status),
                 # so admin IDs won't get recreated by _get_student() auto-approve logic.
                 self.deleted_student_keys.add(target_id)
