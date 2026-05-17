@@ -1539,7 +1539,7 @@ class QuizBot:
             self.api.send_message(chat["id"], "Введи прізвище.")
             return
         if student.status != "approved":
-            self.api.send_message(chat["id"], "Твоя анкета ще не схвалена адміністрацією.")
+            self.api.send_message(chat["id"], "Твої дані ще не схвалено адміністрацією.")
             return
         self._show_main_menu(chat["id"], user["id"])
 
@@ -1621,7 +1621,7 @@ class QuizBot:
             student.awaiting_name = False
             if user_id_int is not None and user_id_int in self.admin_user_ids:
                 student.status = "approved"
-                self.api.send_message(chat["id"], "Запит прийнято. Твій анкетний запис схвалено адміністрацією.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.send_message(chat["id"], "Запит прийнято. Твої дані схвалено адміністрацією.", reply_markup=self._build_back_to_main_keyboard())
             else:
                 student.status = "pending_approval"
                 self.api.send_message(chat["id"], "Запит прийнято. Адміністрація розгляне твою заявку та надішле відповідь.", reply_markup=self._build_back_to_main_keyboard())
@@ -2997,7 +2997,7 @@ class QuizBot:
                 elif student.status == "approved":
                     self._show_main_menu(message["chat"]["id"], message["from"]["id"])
                 else:
-                    self.api.send_message(message["chat"]["id"], "Твоя анкета ще не схвалена адміністрацією.")
+                    self.api.send_message(message["chat"]["id"], "Твої дані ще не схвалено адміністрацією.")
                 return
             if text.startswith("/students") or text.startswith("/approve") or text.startswith("/results") or text.startswith("/settime") or text.startswith("/admin"):
                 self._handle_admin_command(message)
