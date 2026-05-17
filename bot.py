@@ -1982,7 +1982,7 @@ class QuizBot:
             student.current_question_id = None
             student.current_question_message_id = None
             self._persist_students()
-            self.api.send_message(student.chat_id, "Анкета відсутня, заблокована або не схвалена.")
+            self.api.send_message(student.chat_id, "Доступ заборонено")
             return
 
         # Resolve topic_id safely:
@@ -2553,7 +2553,7 @@ class QuizBot:
             student.topic_action_mode = "add"
             student.topic_action_source = None
             self._persist_students()
-            self.api.send_message(chat_id, "Введи назву нової теми одним повідомленням.")
+            self.api.send_message(chat_id, "Введи назву нової теми")
             self.api.answer_callback_query(callback_query["id"], "Очікую назву теми")
             return
         if data.startswith("topic:"):
@@ -2716,7 +2716,7 @@ class QuizBot:
                 return
 
             if student.status != "approved":
-                self.api.answer_callback_query(callback_query["id"], "Анкета заблокована або не схвалена")
+                self.api.answer_callback_query(callback_query["id"], "Доступ заборонено")
                 return
 
             if self._time_is_up(student):
