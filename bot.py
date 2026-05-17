@@ -1104,7 +1104,8 @@ class QuizBot:
                 continue
             self.sessions_store.save_student(state)
 
-    def _notify_admins(self, text: str):
+
+    def _notify_admins(self, text: str, reply_markup: Optional[dict] = None):
         admin_chat_ids: Set[int] = set()
         for state in self.students.values():
             if state.status == "deleted":
@@ -1121,7 +1122,7 @@ class QuizBot:
 
         for admin_chat_id in admin_chat_ids:
             try:
-                self.api.send_message(admin_chat_id, text)
+                self.api.send_message(admin_chat_id, text, reply_markup=reply_markup)
             except RuntimeError as exc:
                 print(f"[admin notify] failed chat_id={admin_chat_id}: {exc}")
 
@@ -1625,7 +1626,13 @@ class QuizBot:
                 student.status = "pending_approval"
                 self.api.send_message(chat["id"], "Запит прийнято. Адміністрація розгляне твою заявку та надішле відповідь.", reply_markup=self._build_back_to_main_keyboard())
                 self._notify_admins(
-                    f"🆕 Нова заявка на схвалення: {student.full_name or f'Учень {student.user_id}'} (ID: {student.user_id})"
+                    f"🆕 Нова заявка на схвалення: {student.full_name or f'Учень {student.user_id}'} (ID: {student.user_id})",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}],
+                            [{"text": "🚫 Відхилити", "callback_data": f"student:block:{student.user_id}"}],
+                        ]
+                    },
                 )
             self._persist_students()
             return
