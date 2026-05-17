@@ -1104,6 +1104,27 @@ class QuizBot:
                 continue
             self.sessions_store.save_student(state)
 
+    def _notify_admins(self, text: str):
+        admin_chat_ids: Set[int] = set()
+        for state in self.students.values():
+            if state.status == "deleted":
+                continue
+            if state.user_id in self.admin_user_ids:
+                try:
+                    if state.chat_id is not None:
+                        admin_chat_ids.add(int(state.chat_id))
+                except (TypeError, ValueError):
+                    continue
+
+        if not admin_chat_ids:
+            return
+
+        for admin_chat_id in admin_chat_ids:
+            try:
+                self.api.send_message(admin_chat_id, text)
+            except RuntimeError as exc:
+                print(f"[admin notify] failed chat_id={admin_chat_id}: {exc}")
+
     def _student_key(self, user_id: int) -> str:
         return str(user_id)
 
@@ -1481,10 +1502,9 @@ class QuizBot:
         user = message["from"]
         user_id = user["id"]
 
-        # If admin was deleted "as student", let them register again:
-        # remove tombstone on /start and switch deleted->new.
+        # remove tombstone on /start and switch deleted->new
         key = self._student_key(user_id)
-        if user_id in self.admin_user_ids and key in getattr(self, "deleted_student_keys", set()):
+        if key in getattr(self, "deleted_student_keys", set()):
             self.deleted_student_keys.remove(key)
             self._persist_state()
 
@@ -1502,8 +1522,9 @@ class QuizBot:
         student.delete_action_source = None
         self._persist_students()
 
-        if user_id in self.admin_user_ids and student.status == "deleted":
+        if student.status == "deleted":
             student.status = "new"
+            self._persist_students()
 
         if student.status in {"new", "awaiting_name"}:
             # Restart onboarding: clear possibly stale names from previous partial state.
@@ -1599,10 +1620,13 @@ class QuizBot:
             student.awaiting_name = False
             if user_id_int is not None and user_id_int in self.admin_user_ids:
                 student.status = "approved"
-                self.api.send_message(chat["id"], "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РўРёРјР°С”С€ Р°РґРјС–РЅ-РґРѕСЃС‚СѓРї.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.send_message(chat["id"], "Запит прийнято. Твій анкетний запис схвалено адміністрацією.", reply_markup=self._build_back_to_main_keyboard())
             else:
                 student.status = "pending_approval"
-                self.api.send_message(chat["id"], "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РћС‡С–РєСѓР№ СЃС…РІР°Р»РµРЅРЅСЃСЃ Р°РґРјС–РЅС–СЃС‚СЂР°С‚РѕСЂР°.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.send_message(chat["id"], "Запит прийнято. Адміністрація розгляне твою заявку та надішле відповідь.", reply_markup=self._build_back_to_main_keyboard())
+                self._notify_admins(
+                    f"🆕 Нова заявка на схвалення: {student.full_name or f'Учень {student.user_id}'} (ID: {student.user_id})"
+                )
             self._persist_students()
             return
 
@@ -2564,6 +2588,22 @@ class QuizBot:
                 target_student.status = "approved"
                 self._persist_students()
                 self._show_student_details(chat_id, target_student)
+
+                # notify student
+                if getattr(target_student, "chat_id", None) is not None:
+                    try:
+                        self.api.send_message(
+                            target_student.chat_id,
+                            "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РўРёРјР°С”С€ Р°РґРјС–РЅ-РґРѕСЃСѓС‚Сƒї.",
+                            reply_markup=self._build_back_to_main_keyboard(),
+                        )
+                    except RuntimeError as exc:
+                        print(f"[student approve notify] failed chat_id={target_student.chat_id}: {exc}")
+
+                # notify all admins
+                self._notify_admins(
+                    f"✅ Учня схвалено: {target_student.full_name or f'Учень {target_student.user_id}'} (ID: {target_student.user_id})"
+                )
             self.api.answer_callback_query(callback_query["id"], "Учня схвалено")
             return
         if data.startswith("student:block:"):
