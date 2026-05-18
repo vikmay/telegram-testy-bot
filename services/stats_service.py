@@ -200,16 +200,16 @@ class StatsService:
             )
 
             total_tests = 0
-            best_score = 0
+            avg_score = 0.0
             try:
                 total_tests = int(self._results_store.user_result_count(user_id))
                 analytics = self.compute_student_analytics(user_id=user_id)
-                best_score = analytics.best_score
+                avg_score = float(analytics.avg_score)
             except Exception:
                 total_tests = 0
-                best_score = 0
+                avg_score = 0.0
 
-            label = f"{full_name} | 📚 {total_tests} | {status_icon} | 🏅 {best_score}"
+            label = f"{full_name} | 📚 {total_tests} | {status_icon} | 🏅 {avg_score:.1f}"
             keyboard_rows.append([{"text": label, "callback_data": f"student:view:{user_id}"}])
 
         # main menu button (matches bot legacy fallback)
