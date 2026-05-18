@@ -7,6 +7,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -526,12 +527,46 @@ class QuizBot:
         self.questions: List[Question] = []
         self.topics: List[Topic] = []
 
-        # Tombstones: prevents `_get_student()` from recreating a deleted student record.
+        # Tombstones + reminders state: persisted in data/state.json.
         raw_state = self.state_store.load()
+
+        admin_chat_ids_raw = raw_state.get("admin_chat_ids", {})
+        self.admin_chat_ids: Dict[str, int] = {}
+        if isinstance(admin_chat_ids_raw, dict):
+            for k, v in admin_chat_ids_raw.items():
+                try:
+                    self.admin_chat_ids[str(int(k))] = int(v)
+                except (TypeError, ValueError):
+                    continue
+
         deleted_keys_raw = raw_state.get("deleted_student_keys", [])
         self.deleted_student_keys: Set[str] = (
             {str(k) for k in deleted_keys_raw} if isinstance(deleted_keys_raw, list) else set()
         )
+
+        self.reminders_enabled: bool = bool(raw_state.get("reminders_enabled", False))
+
+        reminder_times_raw = raw_state.get("reminder_times", [])
+        if isinstance(reminder_times_raw, list):
+            self.reminder_times: List[str] = [str(x).strip() for x in reminder_times_raw if str(x).strip()]
+        else:
+            self.reminder_times = []
+
+        reminder_last_sent_raw = raw_state.get("reminder_last_sent_by_time", {})
+        self.reminder_last_sent_by_time: Dict[str, str] = (
+            {str(k): str(v) for k, v in reminder_last_sent_raw.items()}
+            if isinstance(reminder_last_sent_raw, dict)
+            else {}
+        )
+
+        reminder_disabled_raw = raw_state.get("reminder_disabled_student_keys", [])
+        self.reminder_disabled_student_keys: Set[str] = (
+            {str(k) for k in reminder_disabled_raw} if isinstance(reminder_disabled_raw, list) else set()
+        )
+
+        # Admin helper: when admin clicks “Налаштувати час(и)”, we accept next plain text message as
+        # comma-separated times (e.g. 22:15,22:30) and persist them.
+        self.awaiting_remindertimes_admin_user_ids: Set[int] = set()
 
         self.test_duration_seconds = self._load_test_duration_seconds()
         self._load_data()
@@ -579,14 +614,179 @@ class QuizBot:
             {str(k) for k in current_deleted} if isinstance(current_deleted, (set, list)) else set()
         )
 
-        merged = sorted(existing_set | current_set)
+        # Don’t “resurrect” tombstones for students that are still approved.
+        # This prevents reminders from polluting the admin list via deleted_student_keys.
+        students_raw = self.students_store.load()
+        approved_user_ids: Set[str] = set()
+        if isinstance(students_raw, dict):
+            for _key, row in students_raw.items():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("status") == "approved":
+                    uid = row.get("user_id", _key)
+                    try:
+                        approved_user_ids.add(str(int(uid)))
+                    except (TypeError, ValueError):
+                        continue
+
+        valid_existing = existing_set - approved_user_ids
+        valid_current = current_set - approved_user_ids
+        merged = sorted(valid_existing | valid_current)
+
+        reminders_enabled = bool(getattr(self, "reminders_enabled", False))
+        reminder_times = list(getattr(self, "reminder_times", []))
+        reminder_last_sent_by_time = getattr(self, "reminder_last_sent_by_time", {})
+        reminder_disabled_student_keys = sorted(
+            {str(x) for x in getattr(self, "reminder_disabled_student_keys", set())}
+        )
 
         self.state_store.save(
             {
                 "test_duration_seconds": self.test_duration_seconds,
                 "deleted_student_keys": merged,
+                "reminders_enabled": reminders_enabled,
+                "reminder_times": reminder_times,
+                "reminder_last_sent_by_time": dict(reminder_last_sent_by_time),
+                "reminder_disabled_student_keys": reminder_disabled_student_keys,
+                "admin_chat_ids": {str(k): int(v) for k, v in getattr(self, "admin_chat_ids", {}).items()},
             }
         )
+
+    # --- Reminders (admin-controlled) ---
+
+    def _local_date_key(self) -> str:
+        return datetime.datetime.now().date().isoformat()
+
+    def _normalize_hhmm(self, value: str) -> Optional[str]:
+        cleaned = str(value).strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", cleaned)
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        return f"{hh:02d}:{mm:02d}"
+
+    def _should_send_reminder(self, reminder_time_hhmm: str) -> bool:
+        if not self.reminders_enabled:
+            return False
+
+        norm = self._normalize_hhmm(reminder_time_hhmm)
+        if not norm:
+            return False
+
+        now = datetime.datetime.now()
+        now_hhmm = f"{now.hour:02d}:{now.minute:02d}"
+        if now_hhmm != norm:
+            return False
+
+        last_sent_date = self.reminder_last_sent_by_time.get(norm)
+        return last_sent_date != self._local_date_key()
+
+    def _check_and_send_reminders(self):
+        if not self.reminders_enabled:
+            return
+
+        for reminder_time_raw in list(self.reminder_times):
+            norm = self._normalize_hhmm(reminder_time_raw)
+            if not norm:
+                continue
+            if not self._should_send_reminder(norm):
+                continue
+
+            self._send_reminder_to_all_students(reminder_time_hhmm=norm)
+            self.reminder_last_sent_by_time[norm] = self._local_date_key()
+            self._persist_state()
+
+    def _send_reminder_to_all_students(self, reminder_time_hhmm: str):
+        # Recipients contract:
+        # - recipients are taken ONLY from data/students.json (not sessions/db)
+        # - status == "approved"
+        # - chat_id exists
+        students_raw = self.students_store.load()
+        if not isinstance(students_raw, dict):
+            return
+
+        recipients: List[Tuple[int, int]] = []
+        for _key, row in students_raw.items():
+            if not isinstance(row, dict):
+                continue
+            status = row.get("status")
+            if status != "approved":
+                continue
+            chat_id = row.get("chat_id")
+            user_id = row.get("user_id", _key)
+            try:
+                user_id_int = int(user_id)
+                chat_id_int = int(chat_id) if chat_id is not None else None
+            except (TypeError, ValueError):
+                continue
+            if chat_id_int is None:
+                continue
+            recipients.append((user_id_int, chat_id_int))
+
+        # We persist reminder-disabled keys as strings in state.json.
+        old_disabled_user_ids: Set[str] = set(self.reminder_disabled_student_keys)
+
+        disabled_user_ids: Set[str] = set()
+        success_user_ids: Set[str] = set()
+
+        text = f"⏰ Не забудь пройти тести!"
+
+        for user_id_int, chat_id_int in recipients:
+            user_id_str = str(user_id_int)
+            try:
+                self.api.send_message(chat_id_int, text)
+                success_user_ids.add(user_id_str)
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "chat not found" in msg.lower():
+                    disabled_user_ids.add(user_id_str)
+            except urllib.error.HTTPError as exc:
+                # urlopen can raise HTTPError before our BotApi parses the JSON payload.
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    body = ""
+                combined = f"{exc} {body}".lower()
+                if "chat not found" in combined:
+                    disabled_user_ids.add(user_id_str)
+            except Exception:
+                # Don’t crash the bot on reminder send failures.
+                pass
+
+        # Variant 3 recovery update:
+        # new_disabled = (old_disabled ∪ disabled_user_ids) - (old_disabled ∩ success_user_ids)
+        new_disabled = (old_disabled_user_ids | disabled_user_ids) - (old_disabled_user_ids & success_user_ids)
+        if new_disabled != old_disabled_user_ids:
+            self.reminder_disabled_student_keys = new_disabled
+            self._persist_state()
+
+    # Cleanup: do not let tombstones pollute admin "deleted" filtering for approved students.
+    def _cleanup_deleted_student_keys_tombstones(self):
+        students_raw = self.students_store.load()
+        approved_user_ids: Set[str] = set()
+
+        if isinstance(students_raw, dict):
+            for _key, row in students_raw.items():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("status") == "approved":
+                    uid = row.get("user_id", _key)
+                    try:
+                        approved_user_ids.add(str(int(uid)))
+                    except (TypeError, ValueError):
+                        continue
+
+        if not approved_user_ids:
+            return
+
+        before = set(self.deleted_student_keys)
+        self.deleted_student_keys = set(self.deleted_student_keys) - (self.deleted_student_keys & approved_user_ids)
+        if self.deleted_student_keys != before:
+            self._persist_state()
 
     def _migrate_topics_payload(self, raw) -> List[Topic]:
         topics: List[Topic] = []
@@ -958,6 +1158,8 @@ class QuizBot:
             self._save_topics(self.topics)
 
     def _load_data(self):
+        # Cleanup reminders-related tombstone side-effects (approved students must never be hidden).
+        self._cleanup_deleted_student_keys_tombstones()
         self.topics = self._migrate_topics_payload(self.topics_store.load())
         self._save_topics(self.topics)
 
@@ -1081,6 +1283,20 @@ class QuizBot:
             if student.user_id in self.admin_user_ids and student.status in {"new", "awaiting_name", "pending_approval"}:
                 student.status = "approved"
 
+        # Populate persisted admin chat ids from already-loaded student states.
+        # This fixes case when admins never pressed /start after last restart.
+        try:
+            for admin_uid in self.admin_user_ids:
+                admin_key = str(admin_uid)
+                st = self.students.get(admin_key)
+                if st is None:
+                    continue
+                if st.chat_id is not None:
+                    self.admin_chat_ids[str(admin_uid)] = int(st.chat_id)
+            self._persist_state()
+        except Exception:
+            pass
+
     def _persist_students(self):
         payload = {}
         for key, state in self.students.items():
@@ -1106,14 +1322,18 @@ class QuizBot:
 
 
     def _notify_admins(self, text: str, reply_markup: Optional[dict] = None):
-        admin_chat_ids: Set[int] = set()
+        # Primary: persisted admin chat ids (survive bot restarts).
+        admin_chat_ids: Set[int] = set(getattr(self, "admin_chat_ids", {}).values())
+
+        print(f"[admin notify] start admin_chat_ids={sorted(list(admin_chat_ids))}")
+
+        # Fallback: currently loaded in-memory student states (in case admin_chat_ids is empty).
         for state in self.students.values():
             if state.status == "deleted":
                 continue
-            if state.user_id in self.admin_user_ids:
+            if state.user_id in self.admin_user_ids and state.chat_id is not None:
                 try:
-                    if state.chat_id is not None:
-                        admin_chat_ids.add(int(state.chat_id))
+                    admin_chat_ids.add(int(state.chat_id))
                 except (TypeError, ValueError):
                     continue
 
@@ -1123,7 +1343,7 @@ class QuizBot:
         for admin_chat_id in admin_chat_ids:
             try:
                 self.api.send_message(admin_chat_id, text, reply_markup=reply_markup)
-            except RuntimeError as exc:
+            except Exception as exc:
                 print(f"[admin notify] failed chat_id={admin_chat_id}: {exc}")
 
     def _student_key(self, user_id: int) -> str:
@@ -1476,7 +1696,13 @@ class QuizBot:
     def _build_main_menu_keyboard(self, is_admin: bool):
         keyboard = []
         if is_admin:
-            keyboard.extend([[{"text": "👥 Учні", "callback_data": "admin:students"}], [{"text": "📊 Результати", "callback_data": "admin:results"}], [{"text": "⏱ -30 с", "callback_data": "admin:time:-30"}, {"text": "⏱ +30 с", "callback_data": "admin:time:+30"}], [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}]])
+            keyboard.extend([
+                [{"text": "👥 Учні", "callback_data": "admin:students"}],
+                [{"text": "📊 Результати", "callback_data": "admin:results"}],
+                [{"text": "⏱ -30 с", "callback_data": "admin:time:-30"}, {"text": "⏱ +30 с", "callback_data": "admin:time:+30"}],
+                [{"text": "🔔 Нагадування", "callback_data": "admin:reminders_menu"}],
+                [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}],
+            ])
         keyboard.append([{"text": "📚 Пройти Тести", "callback_data": "back_to_topics"}])
         return {"inline_keyboard": keyboard}
 
@@ -1510,6 +1736,20 @@ class QuizBot:
             self._persist_state()
 
         student = self._get_student(user_id, chat["id"])
+
+        # Persist admin chat_id for reliable _notify_admins() after restarts.
+        # (Telegram ids sometimes arrive as strings depending on serialization; normalize to int.)
+        try:
+            user_id_int = int(user_id)
+        except (TypeError, ValueError):
+            user_id_int = None
+
+        if user_id_int is not None and user_id_int in self.admin_user_ids:
+            try:
+                self.admin_chat_ids[str(user_id_int)] = int(chat["id"])
+                self._persist_state()
+            except (TypeError, ValueError):
+                pass
 
         # /start should reset any "awaiting ..." admin workflows,
         # so we don't end up showing stale "theme not found" messages.
@@ -1553,6 +1793,30 @@ class QuizBot:
             user_id_int = int(user["id"])
         except (TypeError, ValueError):
             user_id_int = None
+
+        # Admin reminder times raw input (e.g. "22:15,22:30") after tapping "Налаштувати час(и)".
+        if user_id_int is not None and user_id_int in getattr(self, "awaiting_remindertimes_admin_user_ids", set()):
+            raw_times = [t.strip() for t in text.split(",") if t.strip()]
+            normalized_times: List[str] = []
+            for t in raw_times:
+                norm = self._normalize_hhmm(t)
+                if norm and norm not in normalized_times:
+                    normalized_times.append(norm)
+
+            if not normalized_times:
+                self.api.send_message(chat["id"], "Не вдалося розпізнати час. Приклад: 22:15,22:30", reply_markup=self._build_back_to_main_keyboard())
+                return
+
+            self.reminder_times = normalized_times
+            self._persist_state()
+
+            self.awaiting_remindertimes_admin_user_ids.remove(user_id_int)
+            self.api.send_message(
+                chat["id"],
+                f"Час нагадувань оновлено: {', '.join(self.reminder_times)}.",
+                reply_markup=self._build_back_to_main_keyboard(),
+            )
+            return
 
         if text.startswith("/start"):
             self._handle_start(message)
@@ -1621,7 +1885,8 @@ class QuizBot:
             student.awaiting_name = False
             if user_id_int is not None and user_id_int in self.admin_user_ids:
                 student.status = "approved"
-                self.api.send_message(chat["id"], "Запит прийнято. Твої дані схвалено адміністрацією.", reply_markup=self._build_back_to_main_keyboard())
+                msg = "Дані отримано. Ти маєш адмін-доступ." if student.user_id in self.admin_user_ids else "Твої дані схвалено.Доступ відкрито."
+                self.api.send_message(chat["id"], msg, reply_markup=self._build_back_to_main_keyboard())
             else:
                 student.status = "pending_approval"
                 self.api.send_message(chat["id"], "Запит прийнято. Адміністрація розгляне твою заявку та надішле відповідь.", reply_markup=self._build_back_to_main_keyboard())
@@ -1717,6 +1982,9 @@ class QuizBot:
             "/results <user_id> — результати конкретного учня",
             "/settime <minutes> — встановити час тесту",
             f"Поточний час тесту: {self._format_duration(self.test_duration_seconds)}.",
+            "/reminders on|off — увімкнути або вимкнути нагадування",
+            "/remindertimes <HH:MM,HH:MM,...> — час нагадувань (24-год формат)",
+            "/reminders show — показати поточні налаштування нагадувань",
             "Для імпорту: спочатку вибери тему в меню тем, потім надішли DOCX.",
         ]
         self.api.send_message(chat_id, "\n".join(lines))
@@ -2281,6 +2549,73 @@ class QuizBot:
                 self.api.send_message(chat_id, f"Час тесту оновлено: {self._format_duration(self.test_duration_seconds)}.")
                 self.api.answer_callback_query(callback_query["id"], "Час оновлено")
                 return
+            if action == "reminders_menu":
+                self.api.answer_callback_query(callback_query["id"], "")
+                enabled = bool(getattr(self, "reminders_enabled", False))
+                times = getattr(self, "reminder_times", [])
+                self.api.send_message(
+                    chat_id,
+                    f"🔔 Нагадування\nСтатус: {'увімкнені' if enabled else 'вимкнені'}\nЧас: {', '.join(times) if times else '—'}",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": "✅ Ввімкнути", "callback_data": "admin:reminders:on"}, {"text": "⛔ Вимкнути", "callback_data": "admin:reminders:off"}],
+                            [{"text": "⏰ Налаштувати час", "callback_data": "admin:remindertimes:help"}],
+                            [{"text": "🏠 Головне меню", "callback_data": "main_menu"}],
+                        ]
+                    },
+                )
+                return
+
+            if action.startswith("reminders:"):
+                reminder_action = action.split(":", 1)[1].strip()
+                if reminder_action == "on":
+                    self.reminders_enabled = True
+                    self._persist_state()
+                    self.api.send_message(chat_id, "Нагадування увімкнені.")
+                elif reminder_action == "off":
+                    self.reminders_enabled = False
+                    self._persist_state()
+                    self.api.send_message(chat_id, "Нагадування вимкнені.")
+                elif reminder_action == "show":
+                    enabled = bool(getattr(self, "reminders_enabled", False))
+                    times = getattr(self, "reminder_times", [])
+                    self.api.send_message(
+                        chat_id,
+                        f"Нагадування: {'увімкнені' if enabled else 'вимкнені'}\n"
+                        f"Час: {', '.join(times) if times else '—'}",
+                    )
+                else:
+                    self.api.send_message(
+                        chat_id,
+                        "Невідома дія. Використай кнопки: увімкнути / вимкнути / показати.\n"
+                        "Для налаштування часу — команду /remindertimes <HH:MM,HH:MM,...>",
+                    )
+
+                self.api.answer_callback_query(callback_query["id"], "")
+                return
+
+            if action.startswith("remindertimes:"):
+                remindertimes_action = action.split(":", 1)[1].strip()
+                if remindertimes_action == "help":
+                    times = getattr(self, "reminder_times", [])
+                    try:
+                        self.awaiting_remindertimes_admin_user_ids.add(int(user["id"]))
+                    except (TypeError, ValueError):
+                        pass
+                    self.api.send_message(
+                        chat_id,
+                        "Налаштування часу нагадувань:\n"
+                        "• Введи час для нагадувань (формат HH:MM)\n"
+                        "Приклад: 09:00,14:30\n"
+                        "Можна вказати кілька разів на день через кому\n"
+                        f"Поточний час: {', '.join(times) if times else '—'}",
+                        reply_markup=self._build_back_to_main_keyboard(),
+                    )
+                else:
+                    self.api.send_message(chat_id, "Невідома дія для нагадувань часу.", reply_markup=self._build_back_to_main_keyboard())
+                self.api.answer_callback_query(callback_query["id"], "")
+                return
+
             if action == "topics":
                 try:
                     self._show_admin_topics_menu(chat_id)
@@ -2628,7 +2963,7 @@ class QuizBot:
                     try:
                         self.api.send_message(
                             target_student.chat_id,
-                            "Р”Р°РЅС– РѕС‚СЂРёРјР°РЅРѕ. РўРёРјР°С”С€ Р°РґРјС–РЅ-РґРѕСЃСѓС‚Сƒї.",
+                            "Твої дані схвалено.Доступ відкрито.",
                             reply_markup=self._build_back_to_main_keyboard(),
                         )
                     except RuntimeError as exc:
@@ -2974,6 +3309,48 @@ class QuizBot:
             self.test_duration_seconds = minutes * 60
             self._persist_state()
             self.api.send_message(chat["id"], f"Час тесту встановлено на {minutes} хв.")
+        elif text.startswith("/reminders"):
+            parts = text.split(maxsplit=2)
+            if text == "/reminders show":
+                enabled = bool(getattr(self, "reminders_enabled", False))
+                times = getattr(self, "reminder_times", [])
+                self.api.send_message(
+                    chat["id"],
+                    f"Нагадування: {'увімкнені' if enabled else 'вимкнені'}\nЧас: {', '.join(times) if times else '—'}",
+                )
+                return
+
+            if len(parts) != 2 or parts[1] not in {"on", "off"}:
+                self.api.send_message(chat["id"], 'Використання: /reminders on|off або /reminders show')
+                return
+
+            self.reminders_enabled = parts[1] == "on"
+            self._persist_state()
+            self.api.send_message(chat["id"], f"Нагадування: {'увімкнено' if self.reminders_enabled else 'вимкнено'}.")
+            return
+
+        elif text.startswith("/remindertimes"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                self.api.send_message(chat["id"], 'Використання: /remindertimes <HH:MM,HH:MM,...>')
+                return
+
+            raw_times = parts[1].split(",")
+            normalized_times: List[str] = []
+            for t in raw_times:
+                norm = self._normalize_hhmm(t)
+                if norm and norm not in normalized_times:
+                    normalized_times.append(norm)
+
+            if not normalized_times:
+                self.api.send_message(chat["id"], "Не вдалося розпізнати час. Приклад: /remindertimes 09:15,21:30")
+                return
+
+            self.reminder_times = normalized_times
+            self._persist_state()
+            self.api.send_message(chat["id"], f"Час нагадувань оновлено: {', '.join(self.reminder_times)}.")
+            return
+
         else:
             self._send_admin_help(chat["id"])
 
@@ -2991,6 +3368,18 @@ class QuizBot:
             if student.awaiting_topic_action or student.awaiting_name or student.awaiting_docx_topic_id:
                 self._handle_text(message)
                 return
+
+            # Admin remindertimes input must be accepted even if an admin is currently inside a quiz
+            # (otherwise we hit the "Для відповіді користуйся кнопками." branch).
+            try:
+                user_id_int = int(message["from"]["id"])
+            except (TypeError, ValueError, KeyError):
+                user_id_int = None
+
+            if user_id_int is not None and user_id_int in getattr(self, "awaiting_remindertimes_admin_user_ids", set()):
+                self._handle_text(message)
+                return
+
             if text.startswith("/menu"):
                 if student.status == "new":
                     self.api.send_message(message["chat"]["id"], "Спочатку натисни /start один раз.")
@@ -3019,14 +3408,17 @@ class QuizBot:
         while True:
             try:
                 updates = self.api.get_updates(offset)
+                self._check_and_send_reminders()
                 for update in updates:
                     offset = update["update_id"] + 1
                     self.process_update(update)
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     print("Telegram conflict: another bot instance is already running.")
+                self._check_and_send_reminders()
                 time.sleep(POLL_INTERVAL_SECONDS)
             except (urllib.error.URLError, Exception):
+                self._check_and_send_reminders()
                 time.sleep(POLL_INTERVAL_SECONDS)
 
 
