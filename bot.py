@@ -1703,6 +1703,9 @@ class QuizBot:
                 [{"text": "🔔 Нагадування", "callback_data": "admin:reminders_menu"}],
                 [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}],
             ])
+        else:
+            keyboard.append([{"text": "📌 Моя картка", "callback_data": "student:mycard"}])
+
         keyboard.append([{"text": "📚 Пройти Тести", "callback_data": "back_to_topics"}])
         return {"inline_keyboard": keyboard}
 
@@ -2930,6 +2933,39 @@ class QuizBot:
             self._start_test(student, topic_id)
             self.api.answer_callback_query(callback_query["id"], "Тест перезапущено")
             return
+        if data == "student:mycard":
+            # Only approved students can view their own card.
+            if student.status != "approved":
+                self.api.answer_callback_query(callback_query["id"], "Доступ не відкрито")
+                self.api.send_message(
+                    chat_id,
+                    "Твої дані ще не схвалено адміністрацією.",
+                    reply_markup=self._build_back_to_main_keyboard(),
+                )
+                return
+
+            full_name = (
+                student.full_name
+                or f"{student.first_name} {student.last_name}".strip()
+                or str(student.user_id)
+            )
+
+            analytics = self.stats_service.compute_student_analytics(
+                user_id=student.user_id,
+                full_name=full_name,
+                status=student.status,
+            )
+            text = self.stats_service.format_student_profile(analytics)
+
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🏠 Головне меню", "callback_data": "main_menu"}]
+                ]
+            }
+            self.api.send_message(chat_id, text, reply_markup=keyboard)
+            self.api.answer_callback_query(callback_query["id"], "Відкрито картку учня")
+            return
+
         if data.startswith("student:view:"):
             try:
                 user_id_int = int(user["id"])
