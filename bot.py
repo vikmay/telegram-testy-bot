@@ -2729,7 +2729,11 @@ class QuizBot:
                             f"{idx}) {q_text}\n"
                     f"   Точність: {accuracy * 100:.0f}% ({correct_attempts}/{total_attempts})"
                         )
-                    self.api.send_message(chat_id, "\n\n".join(lines))
+                    self.api.send_message(
+                        chat_id,
+                        "\n\n".join(lines),
+                        reply_markup=self._build_back_to_main_keyboard(),
+                    )
                 self.api.answer_callback_query(callback_query["id"], "")
                 return
 
