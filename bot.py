@@ -95,6 +95,11 @@ class StudentState:
     delete_action_mode: Optional[str] = None
     delete_action_source: Optional[str] = None
 
+    # Admin: edit student first/last name (two-step text input)
+    admin_edit_target_user_id: Optional[int] = None
+    awaiting_admin_edit_last_name: bool = False
+    awaiting_admin_edit_first_name: bool = False
+
 
 class JsonStore:
     def __init__(self, path: Path, default):
@@ -325,6 +330,11 @@ class SessionStore:
                     awaiting_delete_action INTEGER NOT NULL DEFAULT 0,
                     delete_action_mode TEXT,
                     delete_action_source TEXT,
+
+                    admin_edit_target_user_id INTEGER,
+                    awaiting_admin_edit_last_name INTEGER NOT NULL DEFAULT 0,
+                    awaiting_admin_edit_first_name INTEGER NOT NULL DEFAULT 0,
+
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -345,6 +355,12 @@ class SessionStore:
                 ("awaiting_delete_action", "ALTER TABLE student_sessions ADD COLUMN awaiting_delete_action INTEGER NOT NULL DEFAULT 0"),
                 ("delete_action_mode", "ALTER TABLE student_sessions ADD COLUMN delete_action_mode TEXT"),
                 ("delete_action_source", "ALTER TABLE student_sessions ADD COLUMN delete_action_source TEXT"),
+
+                # Admin: edit student name (two-step input state)
+                ("admin_edit_target_user_id", "ALTER TABLE student_sessions ADD COLUMN admin_edit_target_user_id INTEGER"),
+                ("awaiting_admin_edit_last_name", "ALTER TABLE student_sessions ADD COLUMN awaiting_admin_edit_last_name INTEGER NOT NULL DEFAULT 0"),
+                ("awaiting_admin_edit_first_name", "ALTER TABLE student_sessions ADD COLUMN awaiting_admin_edit_first_name INTEGER NOT NULL DEFAULT 0"),
+
                 ("updated_at", "ALTER TABLE student_sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
             ]
             for column, sql in migrations:
@@ -373,7 +389,8 @@ class SessionStore:
                        pending_multi_answers, matching_pairs, matching_selected_left, shuffled_options, shuffled_matching_left, shuffled_matching_right, current_test_topic_id, current_test_score, current_test_started_at,
                        current_test_duration_seconds, selected_topic_ids, topic_stats, awaiting_name, awaiting_question,
                        awaiting_docx_import, awaiting_docx_topic_id, awaiting_topic_action, topic_action_mode,
-                       topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source
+                       topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source,
+                       admin_edit_target_user_id, awaiting_admin_edit_last_name, awaiting_admin_edit_first_name
                 FROM student_sessions
                 """
             )
@@ -412,6 +429,9 @@ class SessionStore:
                     "awaiting_delete_action": bool(row[25]),
                     "delete_action_mode": row[26],
                     "delete_action_source": row[27],
+                    "admin_edit_target_user_id": row[28],
+                    "awaiting_admin_edit_last_name": bool(row[29]),
+                    "awaiting_admin_edit_first_name": bool(row[30]),
                 }
             return rows
 
@@ -445,6 +465,9 @@ class SessionStore:
             "awaiting_delete_action": int(state.awaiting_delete_action),
             "delete_action_mode": state.delete_action_mode,
             "delete_action_source": state.delete_action_source,
+            "admin_edit_target_user_id": state.admin_edit_target_user_id,
+            "awaiting_admin_edit_last_name": int(state.awaiting_admin_edit_last_name),
+            "awaiting_admin_edit_first_name": int(state.awaiting_admin_edit_first_name),
         }
         with self._connect() as conn:
             conn.execute(
@@ -454,13 +477,15 @@ class SessionStore:
                     pending_multi_answers, matching_pairs, matching_selected_left, current_test_topic_id, current_test_score, current_test_started_at,
                     current_test_duration_seconds, selected_topic_ids, topic_stats, awaiting_name, awaiting_question,
                     awaiting_docx_import, awaiting_docx_topic_id, awaiting_topic_action, topic_action_mode,
-                    topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source, updated_at
+                    topic_action_source, awaiting_delete_action, delete_action_mode, delete_action_source,
+                    admin_edit_target_user_id, awaiting_admin_edit_last_name, awaiting_admin_edit_first_name, updated_at
                 ) VALUES (
                     :user_id, :chat_id, :current_test, :current_index, :current_question_id, :current_question_message_id,
                     :pending_multi_answers, :matching_pairs, :matching_selected_left, :current_test_topic_id, :current_test_score, :current_test_started_at,
                     :current_test_duration_seconds, :selected_topic_ids, :topic_stats, :awaiting_name, :awaiting_question,
                     :awaiting_docx_import, :awaiting_docx_topic_id, :awaiting_topic_action, :topic_action_mode,
-                    :topic_action_source, :awaiting_delete_action, :delete_action_mode, :delete_action_source, CURRENT_TIMESTAMP
+                    :topic_action_source, :awaiting_delete_action, :delete_action_mode, :delete_action_source,
+                    :admin_edit_target_user_id, :awaiting_admin_edit_last_name, :awaiting_admin_edit_first_name, CURRENT_TIMESTAMP
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                     chat_id=excluded.chat_id,
@@ -490,6 +515,9 @@ class SessionStore:
                     awaiting_delete_action=excluded.awaiting_delete_action,
                     delete_action_mode=excluded.delete_action_mode,
                     delete_action_source=excluded.delete_action_source,
+                    admin_edit_target_user_id=excluded.admin_edit_target_user_id,
+                    awaiting_admin_edit_last_name=excluded.awaiting_admin_edit_last_name,
+                    awaiting_admin_edit_first_name=excluded.awaiting_admin_edit_first_name,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 payload,
@@ -1280,6 +1308,7 @@ class QuizBot:
                     normalized_row["current_test_topic_id"] = None
             if "current_test_duration_seconds" not in normalized_row and legacy_current_test_duration_minutes is not None:
                 normalized_row["current_test_duration_seconds"] = int(legacy_current_test_duration_minutes or 0) * 60 or None
+            key = str(normalized_row.get("user_id", key))
             self.students[key] = StudentState(**normalized_row)
 
         for key, session in session_rows.items():
@@ -1324,6 +1353,11 @@ class QuizBot:
             student.awaiting_delete_action = session.get("awaiting_delete_action", student.awaiting_delete_action)
             student.delete_action_mode = session.get("delete_action_mode", student.delete_action_mode)
             student.delete_action_source = session.get("delete_action_source", student.delete_action_source)
+
+            # Admin edit-name (two-step)
+            student.admin_edit_target_user_id = session.get("admin_edit_target_user_id", student.admin_edit_target_user_id)
+            student.awaiting_admin_edit_last_name = session.get("awaiting_admin_edit_last_name", student.awaiting_admin_edit_last_name)
+            student.awaiting_admin_edit_first_name = session.get("awaiting_admin_edit_first_name", student.awaiting_admin_edit_first_name)
         for student in self.students.values():
             student.selected_topic_ids = self._normalize_topic_ids(student.selected_topic_ids or [])
             student.matching_pairs = {
@@ -1369,7 +1403,7 @@ class QuizBot:
             if state.status == "deleted":
                 continue
 
-            payload[key] = {
+            payload[str(state.user_id)] = {
                 "user_id": state.user_id,
                 "chat_id": state.chat_id,
                 "first_name": state.first_name,
@@ -1711,11 +1745,14 @@ class QuizBot:
                 [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
             )
 
+            keyboard["inline_keyboard"].append(
+                [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
+            )
         keyboard["inline_keyboard"].append(
-            [{"text": "🗑 Видалити учня", "callback_data": f"student:delete:{student.user_id}"}]
+            [{"text": "✏️ Редагувати ім’я/прізвище", "callback_data": f"admin:edit_student_name:{student.user_id}"}]
         )
         keyboard["inline_keyboard"].append(
-            [{"text": "⬅️ До списку учнів", "callback_data": "admin:students"}]
+            [{"text": "🗑 Видалити учня", "callback_data": f"student:delete:{student.user_id}"}]
         )
         keyboard["inline_keyboard"].append(
             [{"text": "🏠 Головне меню", "callback_data": "main_menu"}]
@@ -1928,6 +1965,58 @@ class QuizBot:
             self._persist_students()
             self.api.send_message(chat["id"], "Надішли .docx файлом. Питання будуть імпортовані у вибрану тему.")
             return
+
+        # Admin: edit student first/last name (two-step text input)
+        if student.awaiting_admin_edit_last_name or student.awaiting_admin_edit_first_name:
+            if user["id"] not in self.admin_user_ids:
+                return
+
+            target_id = student.admin_edit_target_user_id
+            if target_id is None:
+                student.awaiting_admin_edit_last_name = False
+                student.awaiting_admin_edit_first_name = False
+                self._persist_students()
+                return
+
+            target_student = self.students.get(str(target_id))
+            if not target_student:
+                self.api.send_message(chat["id"], "Учня не знайдено.")
+                student.awaiting_admin_edit_last_name = False
+                student.awaiting_admin_edit_first_name = False
+                student.admin_edit_target_user_id = None
+                self._persist_students()
+                return
+
+            # normalize as onboarding does
+            cleaned = " ".join(word.capitalize() for word in text.split())
+
+            if student.awaiting_admin_edit_last_name:
+                # Step 1: last name (surname)
+                target_student.last_name = cleaned
+                target_student.full_name = f"{target_student.last_name} {target_student.first_name}".strip()
+
+                student.awaiting_admin_edit_last_name = False
+                student.awaiting_admin_edit_first_name = True
+                self._persist_students()
+
+                self.api.send_message(chat["id"], "Введи ім'я.")
+                return
+
+            if student.awaiting_admin_edit_first_name:
+                # Step 2: first name (given name)
+                target_student.first_name = cleaned
+                target_student.full_name = f"{target_student.last_name} {target_student.first_name}".strip()
+
+                student.awaiting_admin_edit_first_name = False
+                student.admin_edit_target_user_id = None
+                self._persist_students()
+
+                self.api.send_message(
+                    chat["id"],
+                    f"Готово! Оновлено ім'я/прізвище учня (ID: {target_id}).",
+                    reply_markup=self._build_back_to_main_keyboard(),
+                )
+                return
 
         if student.awaiting_name:
             # If user sends a command like /start while onboarding expects a name,
@@ -2578,6 +2667,35 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Р СњР ВµР СР В°РЎвЂќ Р С—РЎР‚Р В°Р Р†")
                 return
             action = data.split(":", 1)[1].strip()
+
+            # Admin: edit student first/last name (two-step text input)
+            if action.startswith("edit_student_name:"):
+                if user["id"] not in self.admin_user_ids:
+                    return
+                target_raw = action.split(":", 1)[1].strip()
+                try:
+                    target_id = int(target_raw)
+                except (TypeError, ValueError):
+                    self.api.answer_callback_query(callback_query["id"], "Невірний ID учня")
+                    return
+
+                target_student = self._get_student(target_id, chat_id)
+                if not target_student:
+                    self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+                    return
+
+                student.admin_edit_target_user_id = target_id
+                student.awaiting_admin_edit_last_name = True
+                student.awaiting_admin_edit_first_name = False
+                self._persist_students()
+
+                self.api.send_message(
+                    chat_id,
+                    f"✏️ Редагування імені учня\nID: {target_id}\n\nВведи прізвище:",
+                )
+                self.api.answer_callback_query(callback_query["id"], "")
+                return
+
             if action == "students":
                 self._handle_admin_command({"chat": message["chat"], "from": user, "text": "/students"})
                 self.api.answer_callback_query(callback_query["id"], "Відкрито список учнів")
@@ -3535,7 +3653,13 @@ class QuizBot:
             if text.startswith("/start"):
                 self._handle_start(message)
                 return
-            if student.awaiting_topic_action or student.awaiting_name or student.awaiting_docx_topic_id:
+            if (
+                student.awaiting_topic_action
+                or student.awaiting_name
+                or student.awaiting_docx_topic_id
+                or student.awaiting_admin_edit_last_name
+                or student.awaiting_admin_edit_first_name
+            ):
                 self._handle_text(message)
                 return
 
