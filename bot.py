@@ -149,6 +149,23 @@ class ResultsStore:
                 conn.execute("ALTER TABLE test_results ADD COLUMN questions_count INTEGER")
             conn.commit()
 
+            # Per-question difficulty stats used for admin "hardest questions" ranking.
+            # Stored as aggregated counters:
+            # - total_attempts: how many times a question was graded
+            # - correct_attempts: how many of those attempts were correct
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS question_stats (
+                    question_id TEXT PRIMARY KEY,
+                    topic_id TEXT,
+                    total_attempts INTEGER NOT NULL DEFAULT 0,
+                    correct_attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+
     def topic_accuracy(self, user_id: int) -> Dict[str, float]:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -216,6 +233,54 @@ class ResultsStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM test_results WHERE user_id = ?", (user_id,))
             conn.commit()
+
+    def record_question_attempt(self, question_id: str, topic_id: str, correct: bool):
+        """
+        Updates question_stats counters for admin "hardest questions" ranking.
+        """
+        correct_int = 1 if correct else 0
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO question_stats (question_id, topic_id, total_attempts, correct_attempts)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(question_id) DO UPDATE SET
+                    topic_id=COALESCE(question_stats.topic_id, excluded.topic_id),
+                    total_attempts=question_stats.total_attempts + 1,
+                    correct_attempts=question_stats.correct_attempts + excluded.correct_attempts,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (question_id, topic_id, correct_int),
+            )
+            conn.commit()
+
+    def hardest_questions_global(self, limit: int = 20, min_attempts: int = 5) -> List[Tuple[str, str, int, int, float]]:
+        """
+        Returns rows:
+        (question_id, topic_id, total_attempts, correct_attempts, accuracy)
+        Sorted by:
+          - accuracy ASC
+          - then total_attempts DESC
+        Filtered by:
+          - total_attempts >= min_attempts
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT
+                    question_id,
+                    COALESCE(topic_id, '') AS topic_id,
+                    total_attempts,
+                    correct_attempts,
+                    (1.0 * correct_attempts / NULLIF(total_attempts, 0)) AS accuracy
+                FROM question_stats
+                WHERE total_attempts >= ?
+                ORDER BY accuracy ASC, total_attempts DESC
+                LIMIT ?
+                """,
+                (min_attempts, limit),
+            )
+            return [(row[0], row[1], row[2], row[3], float(row[4])) for row in cursor.fetchall()]
 
 
 class SessionStore:
@@ -1699,6 +1764,7 @@ class QuizBot:
             keyboard.extend([
                 [{"text": "👥 Учні", "callback_data": "admin:students"}],
                 [{"text": "📊 Результати", "callback_data": "admin:results"}],
+                [{"text": "🧠 Рейтинг найважчих питань", "callback_data": "admin:hardest"}],
                 [{"text": "⏱ -30 с", "callback_data": "admin:time:-30"}, {"text": "⏱ +30 с", "callback_data": "admin:time:+30"}],
                 [{"text": "🔔 Нагадування", "callback_data": "admin:reminders_menu"}],
                 [{"text": "⚙️ Налаштування тем", "callback_data": "admin:topics"}],
@@ -2392,6 +2458,11 @@ class QuizBot:
             self.api.send_message(student.chat_id, "Питання не знайдено.")
             return
         correct = self._check_answer(question, selected_indexes)
+        self.results_store.record_question_attempt(
+            question_id=question.id,
+            topic_id=question.topic_id,
+            correct=correct,
+        )
         student.total_attempts += 1
         stats = student.topic_stats.setdefault(question.topic_id, {"correct": 0, "total": 0})
         stats["total"] += 1
@@ -2419,6 +2490,22 @@ class QuizBot:
         expected_pairs = {(index + 1, value + 1) for index, value in enumerate(question.answer)}
         provided_pairs = {(left, right) for left, right in pairs if left > 0 and right > 0}
         correct = provided_pairs == expected_pairs
+        self.results_store.record_question_attempt(
+            question_id=question.id,
+            topic_id=question.topic_id,
+            correct=correct,
+        )
+        self.results_store.record_question_attempt(
+            question_id=question.id,
+            topic_id=question.topic_id,
+            correct=correct,
+        )
+
+        self.results_store.record_question_attempt(
+            question_id=question.id,
+            topic_id=question.topic_id,
+            correct=correct,
+        )
 
         student.total_attempts += 1
         stats = student.topic_stats.setdefault(question.topic_id, {"correct": 0, "total": 0})
@@ -2503,7 +2590,29 @@ class QuizBot:
             # admin:results:user:<user_id>:page:<n> -> user results page n
             if action == "results":
                 self._send_results_report(chat_id, target_user_id=None, page=0)
-                self.api.answer_callback_query(callback_query["id"], "Відкрито результати")
+                self.api.answer_callback_query(callback_query["id"], "Р’С–РґРєСЂРёС‚Рѕ СЂРµР·СѓР»СЊС‚Р°С‚Рё")
+                return
+
+            if action == "hardest":
+                top = self.results_store.hardest_questions_global(limit=20, min_attempts=5)
+                if not top:
+                    self.api.send_message(
+                        chat_id,
+                        "Немає достатньо даних для рейтингу (потрібно ≥ 5 спроб на питання).",
+                    )
+                else:
+                    lines = ["🧠 Рейтинг найважчих питань (за точністю):"]
+                    for idx, (question_id, _topic_id, total_attempts, correct_attempts, accuracy) in enumerate(top, start=1):
+                        q = self._find_question(question_id)
+                        q_text = (q.question if q else question_id).strip() or str(question_id)
+                        if len(q_text) > 220:
+                            q_text = q_text[:217] + "..."
+                        lines.append(
+                            f"{idx}) {q_text}\n"
+                    f"   Точність: {accuracy * 100:.0f}% ({correct_attempts}/{total_attempts})"
+                        )
+                    self.api.send_message(chat_id, "\n\n".join(lines))
+                self.api.answer_callback_query(callback_query["id"], "")
                 return
 
             if action.startswith("results:page:"):
@@ -3345,6 +3454,31 @@ class QuizBot:
             self.test_duration_seconds = minutes * 60
             self._persist_state()
             self.api.send_message(chat["id"], f"Час тесту встановлено на {minutes} хв.")
+        elif text.startswith("/hardest"):
+            top = self.results_store.hardest_questions_global(limit=20, min_attempts=5)
+            if not top:
+                self.api.send_message(chat["id"], "Немає достатньо даних для рейтингу (потрібно ≥ 5 спроб на питання).")
+                return
+
+            lines = ["🧠 Рейтинг найважчих питань (за точністю):"]
+            for idx, (question_id, _topic_id, total_attempts, correct_attempts, accuracy) in enumerate(top, start=1):
+                q = self._find_question(question_id)
+                q_text = q.question if q else question_id
+                q_text = q_text.strip()
+                if not q_text:
+                    q_text = question_id
+                # Keep message readable: limit per-question text length.
+                if len(q_text) > 220:
+                    q_text = q_text[:217] + "..."
+
+                lines.append(
+                    f"{idx}) {q_text}\n"
+                    f"   Точність: {accuracy * 100:.0f}% ({correct_attempts}/{total_attempts})"
+                )
+
+            self.api.send_message(chat["id"], "\n\n".join(lines))
+            return
+
         elif text.startswith("/reminders"):
             parts = text.split(maxsplit=2)
             if text == "/reminders show":
@@ -3424,7 +3558,7 @@ class QuizBot:
                 else:
                     self.api.send_message(message["chat"]["id"], "Твої дані ще не схвалено адміністрацією.")
                 return
-            if text.startswith("/students") or text.startswith("/approve") or text.startswith("/results") or text.startswith("/settime") or text.startswith("/admin"):
+            if text.startswith("/students") or text.startswith("/approve") or text.startswith("/results") or text.startswith("/settime") or text.startswith("/admin") or text.startswith("/hardest"):
                 self._handle_admin_command(message)
                 return
             if student.current_question_id:

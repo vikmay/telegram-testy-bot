@@ -54,7 +54,7 @@ python bot.py
 ### SQLite databases (project root)
 
 - `sessions.db` — per-user dialog/test state (what the bot expects next)
-- `results.db` — test result history
+- `results.db` — test result history + per-question difficulty stats (used for admin ratings)
 
 ## Question format (`data/questions.json`)
 
@@ -92,6 +92,8 @@ The bot provides admin commands such as:
 - `/approve <user_id>` — approve a student
 - `/results` — view results
 - `/settime` — configure test duration / reminder-related settings
+- `/hardest` — show **top-20 hardest questions globally**  
+  (filters: ≥5 graded attempts per question; metric: **Точність %** = `correct_attempts / total_attempts * 100` (rounded to an integer percent); sorting: lowest accuracy first, then total attempts DESC)
 - `/admin` — admin help / menu
 
 Additionally, a lot of admin actions are done via **inline buttons/menus** (topics, DOCX import, etc.).
