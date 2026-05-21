@@ -1,69 +1,69 @@
-# MyTestStudent
+# telegram-testy-bot
 
-Telegram math quiz bot for students and administrators.
+Telegram math quiz bot for **students** and **administrators**.
 
-## What it does
+## Main features
 
-- one-time student identification
-- admin approval before access
-- topic-based randomized tests
-- single-choice, multiple-choice, and matching questions
-- immediate right/wrong feedback
-- score tracking
-- admin result viewing
-- question bank stored in JSON
-- optional GPT-based expansion can be added later
+### Student flow
+
+- Entry via **/start**
+- Student profile collection (name/surname) and **admin approval** before access
+- **Topic-based** randomized tests
+- Question types:
+    - `single` (single choice)
+    - `multi` (multiple choice)
+    - `matching` (pair matching)
+    - `text` (free text)
+- Immediate feedback (right/wrong) and scoring
+
+### Admin flow
+
+- View students, approve/block access
+- Manage topics and questions
+- **Import questions from a DOCX file** into a selected topic
+- Configure test duration and **reminder times** (optional scheduled reminders)
 
 ## Requirements
 
 - Python 3.10+
-- Telegram bot token from BotFather
+- A Telegram Bot token (BotFather)
 
-## Setup
+## Configuration (token)
 
-1. Set the token environment variable:
+The bot reads the token from one of these places:
 
-    Windows PowerShell:
+- Environment variable: `TELEGRAM_BOT_TOKEN`
+- Or `token.txt` in the project root
 
-    ```powershell
-    $env:TELEGRAM_BOT_TOKEN="your_token_here"
-    ```
+## Run
 
-    Command Prompt:
+```bash
+python bot.py
+```
 
-    ```cmd
-    set TELEGRAM_BOT_TOKEN=your_token_here
-    ```
+## Data storage
 
-2. Run the bot:
+### JSON files (`data/`)
 
-    ```bash
-    python bot.py
-    ```
+- `students.json` — student records + status (`new/approved/...`) + chat_id
+- `admins.json` — admin Telegram `user_id`s
+- `topics.json` — list of topics (active/inactive, order)
+- `questions.json` — question bank
+- `state.json` — global bot settings (test duration, reminder settings, tombstones)
 
-## Files
+### SQLite databases (project root)
 
-- `bot.py` — main bot implementation
-- `data/questions.json` — question bank
-- `data/students.json` — student records
-- `data/admins.json` — admin user IDs
-- `data/state.json` — reserved for future state persistence
+- `sessions.db` — per-user dialog/test state (what the bot expects next)
+- `results.db` — test result history
 
-## Admin commands
+## Question format (`data/questions.json`)
 
-- `/students` — list students
-- `/approve <user_id>` — approve a student
-- `/results` — view scores
-- `/admin` — admin help
-
-## Question format
-
-Each question in `data/questions.json` uses this structure:
+Each question object looks like this:
 
 ```json
 {
     "id": "pl-1",
-    "topic": "Планіметрія",
+    "topic_id": "planimeteria",
     "type": "single",
     "question": "Question text",
     "options": ["A", "B", "C", "D"],
@@ -79,6 +79,31 @@ Supported `type` values:
 - `matching`
 - `text`
 
+**Notes**
+
+- The current code uses `topic_id`.
+- For backward compatibility, legacy imports may contain `topic` instead of `topic_id` (the bot migrates it internally).
+
+## Admin commands (by text commands)
+
+The bot provides admin commands such as:
+
+- `/students` — list students
+- `/approve <user_id>` — approve a student
+- `/results` — view results
+- `/settime` — configure test duration / reminder-related settings
+- `/admin` — admin help / menu
+
+Additionally, a lot of admin actions are done via **inline buttons/menus** (topics, DOCX import, etc.).
+
+## DOCX import
+
+Admins can upload a `.docx` file to import questions into a selected topic.
+The bot parses the DOCX contents and converts them into the internal question model.
+
 ## Notes
 
-This is a working rebuild based on the provided requirements, because the archive contained only a compiled `.exe` and no source project.
+This repository is a single-binary style project:
+
+- all runtime logic is in `bot.py`
+- statistics/accuracy logic is in `services/stats_service.py`
