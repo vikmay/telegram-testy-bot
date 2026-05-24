@@ -109,3 +109,4 @@ This repository is a single-binary style project:
 
 - all runtime logic is in `bot.py`
 - statistics/accuracy logic is in `services/stats_service.py`
+- test message
