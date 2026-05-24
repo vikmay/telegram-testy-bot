@@ -4,6 +4,7 @@ on:
     push:
         branches:
             - main
+            - develop
 
 jobs:
     deploy:
@@ -20,33 +21,54 @@ jobs:
                   script: |
                       set -euo pipefail
 
-                      REPO_DIR="/home/ubuntu/telegram-testy-bot"
-                      SERVICE_NAME="telegram-testy-bot"
-                      BRANCH="main"
+                      # ------------------------------------------------------------------
+                      # BRANCH → BOT ROUTING
+                      # ------------------------------------------------------------------
+                      BRANCH="${GITHUB_REF_NAME}"
 
+                      if [ "$BRANCH" = "main" ]; then
+                        REPO_DIR="/home/ubuntu/telegram-testy-bot"
+                        SERVICE_NAME="telegram-testy-bot"
+                      else
+                        REPO_DIR="/home/ubuntu/telegram-testy-bot_2"
+                        SERVICE_NAME="telegram-testy-bot_2"
+                      fi
+
+                      echo "Deploying branch: $BRANCH → $SERVICE_NAME"
+
+                      # ------------------------------------------------------------------
+                      # SSH KEY FOR GIT
+                      # ------------------------------------------------------------------
                       mkdir -p "$HOME/.ssh"
-
                       DEPLOY_KEY_PATH="$HOME/.ssh/deploy_key"
 
                       echo "${{ secrets.DEPLOY_KEY }}" > "$DEPLOY_KEY_PATH"
-
                       chmod 600 "$DEPLOY_KEY_PATH"
 
                       ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
-
                       export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
 
-                      mkdir -p "$REPO_DIR"
+                      # ------------------------------------------------------------------
+                      # STOP SERVICE (IMPORTANT: avoid double run / Telegram conflict)
+                      # ------------------------------------------------------------------
+                      sudo systemctl stop "$SERVICE_NAME" || true
 
                       # ------------------------------------------------------------------
-                      # FIRST DEPLOY
+                      # REPO SYNC (clean + safe)
                       # ------------------------------------------------------------------
+                      if [ -d "$REPO_DIR/.git" ]; then
+                        cd "$REPO_DIR"
 
-                      if [ ! -d "$REPO_DIR/.git" ]; then
-                        echo "Fresh clone..."
+                        git fetch origin "$BRANCH"
+                        git reset --hard "origin/$BRANCH"
 
+                        git clean -fd \
+                          -e token.txt \
+                          -e venv \
+                          -e "*.db" \
+                          -e "data"
+                      else
                         rm -rf "$REPO_DIR"
-
                         git clone \
                           --depth 1 \
                           --branch "$BRANCH" \
@@ -57,85 +79,41 @@ jobs:
                       cd "$REPO_DIR"
 
                       # ------------------------------------------------------------------
-                      # TOKEN SAFETY
+                      # PRESERVE DATA (ONLY IF EXISTS)
                       # ------------------------------------------------------------------
-
-                      if [ ! -f token.txt ] && [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
-                        echo "${{ secrets.TELEGRAM_BOT_TOKEN }}" > token.txt
-                        chmod 600 token.txt || true
-                      fi
-
-                      # ------------------------------------------------------------------
-                      # PRESERVE LOCAL JSON FILES
-                      # ------------------------------------------------------------------
-
                       QUESTIONS_BAK="$(mktemp)"
                       TOPICS_BAK="$(mktemp)"
 
-                      if [ -f data/questions.json ]; then
-                        cp data/questions.json "$QUESTIONS_BAK"
-                      fi
-
-                      if [ -f data/topics.json ]; then
-                        cp data/topics.json "$TOPICS_BAK"
-                      fi
-
-                      # ------------------------------------------------------------------
-                      # UPDATE REPO
-                      # ------------------------------------------------------------------
-
-                      git fetch --prune origin "$BRANCH"
-
-                      # force sync with remote
-                      git reset --hard "origin/$BRANCH"
-
-                      # clean untracked files but preserve runtime data
-                      git clean -fd \
-                        -e token.txt \
-                        -e venv \
-                        -e "*.db" \
-                        -e "data/state.json"
-
-                      # ------------------------------------------------------------------
-                      # RESTORE LOCAL JSON FILES
-                      # ------------------------------------------------------------------
+                      [ -f data/questions.json ] && cp data/questions.json "$QUESTIONS_BAK" || true
+                      [ -f data/topics.json ] && cp data/topics.json "$TOPICS_BAK" || true
 
                       mkdir -p data
 
-                      if [ -s "$QUESTIONS_BAK" ]; then
-                        cp "$QUESTIONS_BAK" data/questions.json
-                      fi
-
-                      if [ -s "$TOPICS_BAK" ]; then
-                        cp "$TOPICS_BAK" data/topics.json
-                      fi
+                      # restore
+                      [ -s "$QUESTIONS_BAK" ] && cp "$QUESTIONS_BAK" data/questions.json || true
+                      [ -s "$TOPICS_BAK" ] && cp "$TOPICS_BAK" data/topics.json || true
 
                       rm -f "$QUESTIONS_BAK" "$TOPICS_BAK"
 
                       # ------------------------------------------------------------------
-                      # PYTHON VENV
+                      # VENV (SAFE RECREATE IF BROKEN)
                       # ------------------------------------------------------------------
-
-                      if [ ! -x "$REPO_DIR/venv/bin/python" ]; then
-                        echo "Creating venv..."
-
-                        sudo -H python3 -m venv "$REPO_DIR/venv"
+                      if [ ! -d "venv" ] || [ ! -x "venv/bin/python" ]; then
+                        echo "Recreating venv..."
+                        rm -rf venv
+                        python3 -m venv venv
                       fi
 
-                      # ------------------------------------------------------------------
-                      # INSTALL DEPENDENCIES
-                      # ------------------------------------------------------------------
+                      venv/bin/pip install --upgrade pip || true
 
                       if [ -f requirements.txt ]; then
-                        "$REPO_DIR/venv/bin/pip" install -r requirements.txt
+                        venv/bin/pip install -r requirements.txt
                       fi
 
                       # ------------------------------------------------------------------
-                      # RESTART SERVICE
+                      # START SERVICE
                       # ------------------------------------------------------------------
-
-                      echo "Restarting service: $SERVICE_NAME"
-
+                      echo "Starting service: $SERVICE_NAME"
                       sudo systemctl restart "$SERVICE_NAME"
 
                       echo "Deploy complete"
