@@ -171,6 +171,23 @@ class ResultsStore:
             )
             conn.commit()
 
+            # Canonical question difficulty stats:
+            # We aggregate stats by a stable key derived from question content (not UUID),
+            # so re-imports / UUID changes still map to the same "logical" question.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS canonical_question_stats (
+                    canonical_key TEXT PRIMARY KEY,
+                    topic_id TEXT,
+                    question_text TEXT NOT NULL DEFAULT '',
+                    total_attempts INTEGER NOT NULL DEFAULT 0,
+                    correct_attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+
     def topic_accuracy(self, user_id: int) -> Dict[str, float]:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -239,53 +256,102 @@ class ResultsStore:
             conn.execute("DELETE FROM test_results WHERE user_id = ?", (user_id,))
             conn.commit()
 
-    def record_question_attempt(self, question_id: str, topic_id: str, correct: bool):
+    def record_question_attempt(
+        self,
+        question_id: str,
+        topic_id: str,
+        correct: bool,
+        *,
+        canonical_key: Optional[str] = None,
+        question_text: str = "",
+    ):
         """
-        Updates question_stats counters for admin "hardest questions" ranking.
+        Updates difficulty counters.
+
+        Backward compatible:
+        - question_stats (by question_id) is still updated
+        - canonical_question_stats (by canonical_key) is updated if canonical_key is provided
         """
         correct_int = 1 if correct else 0
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO question_stats (question_id, topic_id, total_attempts, correct_attempts)
-                VALUES (?, ?, 1, ?)
-                ON CONFLICT(question_id) DO UPDATE SET
-                    topic_id=COALESCE(question_stats.topic_id, excluded.topic_id),
-                    total_attempts=question_stats.total_attempts + 1,
-                    correct_attempts=question_stats.correct_attempts + excluded.correct_attempts,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (question_id, topic_id, correct_int),
-            )
+            # Legacy stats (UUID based)
+            if question_id:
+                conn.execute(
+                    """
+                    INSERT INTO question_stats (question_id, topic_id, total_attempts, correct_attempts)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(question_id) DO UPDATE SET
+                        topic_id=COALESCE(question_stats.topic_id, excluded.topic_id),
+                        total_attempts=question_stats.total_attempts + 1,
+                        correct_attempts=question_stats.correct_attempts + excluded.correct_attempts,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (question_id, topic_id, correct_int),
+                )
+
+            # Canonical stats (content based)
+            if canonical_key:
+                conn.execute(
+                    """
+                    INSERT INTO canonical_question_stats (canonical_key, topic_id, question_text, total_attempts, correct_attempts)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(canonical_key) DO UPDATE SET
+                        topic_id=COALESCE(canonical_question_stats.topic_id, excluded.topic_id),
+                        question_text=CASE
+                            WHEN canonical_question_stats.question_text IS NULL OR canonical_question_stats.question_text = '' THEN excluded.question_text
+                            ELSE canonical_question_stats.question_text
+                        END,
+                        total_attempts=canonical_question_stats.total_attempts + 1,
+                        correct_attempts=canonical_question_stats.correct_attempts + excluded.correct_attempts,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (canonical_key, topic_id, question_text or "", correct_int),
+                )
+
             conn.commit()
 
-    def hardest_questions_global(self, limit: int = 20, min_attempts: int = 5) -> List[Tuple[str, str, int, int, float]]:
+    def hardest_questions_global(
+        self, limit: int = 20, min_attempts: int = 5
+    ) -> List[Tuple[str, str, int, int, float, str]]:
         """
         Returns rows:
-        (question_id, topic_id, total_attempts, correct_attempts, accuracy)
+        (canonical_key, topic_id, total_attempts, correct_attempts, accuracy, question_text)
+
         Sorted by:
           - accuracy ASC
           - then total_attempts DESC
+
         Filtered by:
           - total_attempts >= min_attempts
         """
         with self._connect() as conn:
+            # Prefer canonical stats (stable across UUID changes)
             cursor = conn.execute(
                 """
                 SELECT
-                    question_id,
+                    canonical_key,
                     COALESCE(topic_id, '') AS topic_id,
                     total_attempts,
                     correct_attempts,
-                    (1.0 * correct_attempts / NULLIF(total_attempts, 0)) AS accuracy
-                FROM question_stats
+                    (1.0 * correct_attempts / NULLIF(total_attempts, 0)) AS accuracy,
+                    COALESCE(question_text, '') AS question_text
+                FROM canonical_question_stats
                 WHERE total_attempts >= ?
                 ORDER BY accuracy ASC, total_attempts DESC
                 LIMIT ?
                 """,
                 (min_attempts, limit),
             )
-            return [(row[0], row[1], row[2], row[3], float(row[4])) for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            if rows:
+                return [
+                    (row[0], row[1], row[2], row[3], float(row[4]), str(row[5] or ""))
+                    for row in rows
+                ]
+
+            # No fallback: canonical stats only.
+            # This prevents showing legacy UUIDs in the "hardest questions" admin UI.
+            return []
 
 
 class SessionStore:
@@ -2541,6 +2607,27 @@ class QuizBot:
                 pairs.append((left, right))
         return pairs
 
+    def _canonical_key_for_question(self, question: Question) -> str:
+        def norm(value: str) -> str:
+            cleaned = str(value or "").strip()
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            return cleaned.casefold()
+
+        payload = {
+            "type": question.type,
+            "question": norm(question.question),
+            "options": [norm(opt) for opt in (question.options or [])],
+        }
+
+        answers = list(question.answer or [])
+        if question.type != "matching":
+            answers = sorted(answers)
+        payload["answer"] = answers
+
+        canonical_raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        digest = hashlib.sha1(canonical_raw.encode("utf-8")).hexdigest()
+        return f"cq:{digest}"
+
     def _grade_question(self, student: StudentState, selected_indexes: Set[int]):
         question = self._find_question(student.current_question_id or "")
         if not question:
@@ -2551,6 +2638,8 @@ class QuizBot:
             question_id=question.id,
             topic_id=question.topic_id,
             correct=correct,
+            canonical_key=self._canonical_key_for_question(question),
+            question_text=(question.question or "").strip(),
         )
         student.total_attempts += 1
         stats = student.topic_stats.setdefault(question.topic_id, {"correct": 0, "total": 0})
@@ -2583,17 +2672,8 @@ class QuizBot:
             question_id=question.id,
             topic_id=question.topic_id,
             correct=correct,
-        )
-        self.results_store.record_question_attempt(
-            question_id=question.id,
-            topic_id=question.topic_id,
-            correct=correct,
-        )
-
-        self.results_store.record_question_attempt(
-            question_id=question.id,
-            topic_id=question.topic_id,
-            correct=correct,
+            canonical_key=self._canonical_key_for_question(question),
+            question_text=(question.question or "").strip(),
         )
 
         student.total_attempts += 1
@@ -2712,7 +2792,7 @@ class QuizBot:
                 return
 
             if action == "hardest":
-                top = self.results_store.hardest_questions_global(limit=20, min_attempts=5)
+                top = self.results_store.hardest_questions_global(limit=5, min_attempts=5)
                 if not top:
                     self.api.send_message(
                         chat_id,
@@ -2720,9 +2800,8 @@ class QuizBot:
                     )
                 else:
                     lines = ["🧠 Рейтинг найважчих питань (за точністю):"]
-                    for idx, (question_id, _topic_id, total_attempts, correct_attempts, accuracy) in enumerate(top, start=1):
-                        q = self._find_question(question_id)
-                        q_text = (q.question if q else question_id).strip() or str(question_id)
+                    for idx, (_canonical_key, _topic_id, total_attempts, correct_attempts, accuracy, question_text) in enumerate(top, start=1):
+                        q_text = str(question_text or "").strip() or str(_canonical_key)
                         if len(q_text) > 220:
                             q_text = q_text[:217] + "..."
                         lines.append(
@@ -3577,18 +3656,14 @@ class QuizBot:
             self._persist_state()
             self.api.send_message(chat["id"], f"Час тесту встановлено на {minutes} хв.")
         elif text.startswith("/hardest"):
-            top = self.results_store.hardest_questions_global(limit=20, min_attempts=5)
+            top = self.results_store.hardest_questions_global(limit=5, min_attempts=5)
             if not top:
                 self.api.send_message(chat["id"], "Немає достатньо даних для рейтингу (потрібно ≥ 5 спроб на питання).")
                 return
 
             lines = ["🧠 Рейтинг найважчих питань (за точністю):"]
-            for idx, (question_id, _topic_id, total_attempts, correct_attempts, accuracy) in enumerate(top, start=1):
-                q = self._find_question(question_id)
-                q_text = q.question if q else question_id
-                q_text = q_text.strip()
-                if not q_text:
-                    q_text = question_id
+            for idx, (_canonical_key, _topic_id, total_attempts, correct_attempts, accuracy, question_text) in enumerate(top, start=1):
+                q_text = str(question_text or "").strip() or str(_canonical_key)
                 # Keep message readable: limit per-question text length.
                 if len(q_text) > 220:
                     q_text = q_text[:217] + "..."
