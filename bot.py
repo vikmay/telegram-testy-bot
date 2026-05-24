@@ -1855,7 +1855,16 @@ class QuizBot:
 
     def _show_main_menu(self, chat_id: int, user_id: int):
         is_admin = user_id in self.admin_user_ids
-        self.api.send_message(chat_id, f"Головне меню:\nПоточний час тесту: {self._format_duration(self.test_duration_seconds)}.", reply_markup=self._build_main_menu_keyboard(is_admin))
+        reminders_line = (
+            f"Нагадування увімкнені: {', '.join(self.reminder_times)}"
+            if self.reminders_enabled and self.reminder_times
+            else "Нагадування вимкнені"
+        )
+        self.api.send_message(
+            chat_id,
+            f"Головне меню:\nПоточний час тесту: {self._format_duration(self.test_duration_seconds)}.\n{reminders_line}",
+            reply_markup=self._build_main_menu_keyboard(is_admin),
+        )
 
     def _build_main_menu_keyboard(self, is_admin: bool):
         keyboard = []
