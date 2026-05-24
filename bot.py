@@ -1562,6 +1562,7 @@ class QuizBot:
         matching_selected_left: Optional[int] = None,
         matching_left_map: Optional[List[int]] = None,
         matching_right_map: Optional[List[int]] = None,
+        compact_mode: bool = False,
     ):
         keyboard = []
         selected_indexes = selected_indexes or set()
@@ -1582,11 +1583,17 @@ class QuizBot:
                 row = []
                 if index < len(left_options):
                     left_mark = "✅ " if index in matching_pairs else ("👉 " if matching_selected_left == index else "")
-                    left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 22)}"
+                    if compact_mode:
+                        left_label = f"{left_mark}{index + 1}".strip()
+                    else:
+                        left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 22)}"
                     row.append({"text": left_label, "callback_data": f"answer:left:{index}"})
                 if index < len(right_options):
                     right_mark = "✅ " if index in matching_pairs.values() else ""
-                    right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 22)}"
+                    if compact_mode:
+                        right_label = f"{right_mark}{chr(ord('a') + index)}".strip()
+                    else:
+                        right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 22)}"
                     row.append({"text": right_label, "callback_data": f"answer:right:{index}"})
                 keyboard.append(row)
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
@@ -1594,16 +1601,46 @@ class QuizBot:
             return {"inline_keyboard": keyboard}
         if question_type == "multi":
             for index, option in enumerate(options, start=1):
-                label = f"{index}. {trim_label(option, 34)}"
-                if (index - 1) in selected_indexes:
-                    label = f"✅ {label}"
+                if compact_mode:
+                    label = f"{index}"
+                    if (index - 1) in selected_indexes:
+                        label = f"✅ {label}"
+                else:
+                    label = f"{index}. {trim_label(option, 34)}"
+                    if (index - 1) in selected_indexes:
+                        label = f"✅ {label}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
         else:
             for index, option in enumerate(options, start=1):
-                label = f"{index}. {trim_label(option, 34)}"
+                if compact_mode:
+                    label = f"{index}"
+                else:
+                    label = f"{index}. {trim_label(option, 34)}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
         return {"inline_keyboard": keyboard}
+
+    def _compact_mode_for_question(self, question: Question) -> bool:
+        if question.type == "text":
+            return False
+        threshold = 32
+        try:
+            return any(len(str(opt)) > threshold for opt in (question.options or []) if opt is not None)
+        except Exception:
+            return False
+
+    def _render_compact_options_text(self, question: Question) -> str:
+        if question.type == "matching":
+            half = len(question.options) // 2
+            left_options = question.options[:half] if half else question.options
+            right_options = question.options[half:] if half else []
+            left_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(left_options))
+            right_lines = "\n".join(
+                f"{chr(ord('a') + i)}) {opt}" for i, opt in enumerate(right_options)
+            )
+            return f"Ліва колонка:\n{left_lines}\n\nПрава колонка:\n{right_lines}"
+        lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(question.options or []))
+        return f"Варіанти:\n{lines}"
 
     def _get_topics(self) -> List[Topic]:
         return [topic for topic in self.topics if topic.active]
@@ -2551,6 +2588,9 @@ class QuizBot:
             elapsed = int(time.time() - float(student.current_test_started_at))
             remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
             text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+
+        compact_mode = self._compact_mode_for_question(question)
+
         if question.type == "matching":
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
@@ -2575,21 +2615,48 @@ class QuizBot:
                     question_type="matching",
                     matching_pairs=student.matching_pairs,
                     matching_selected_left=student.matching_selected_left,
+                    compact_mode=compact_mode,
                 ),
             )
             if isinstance(sent_message, dict) and "message_id" in sent_message:
                 student.current_question_message_id = sent_message["message_id"]
                 self._persist_students()
             return
+
         if question.type == "multi":
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
+            if compact_mode:
+                opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
+                text += f"\n\nВаріанти:\n{opts_lines}"
             text += "\n\nВибрано: нічого"
-            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
+            sent_message = self.api.send_message(
+                student.chat_id,
+                text,
+                reply_markup=self._build_keyboard(
+                    shuffled_options,
+                    question_type=question.type,
+                    selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options},
+                    compact_mode=compact_mode,
+                ),
+            )
         else:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
-            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes=None))
+            if compact_mode:
+                opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
+                text += f"\n\nВаріанти:\n{opts_lines}"
+            sent_message = self.api.send_message(
+                student.chat_id,
+                text,
+                reply_markup=self._build_keyboard(
+                    shuffled_options,
+                    question_type=question.type,
+                    selected_indexes=None,
+                    compact_mode=compact_mode,
+                ),
+            )
+
         if isinstance(sent_message, dict) and "message_id" in sent_message:
             student.current_question_message_id = sent_message["message_id"]
             self._persist_students()
@@ -3449,6 +3516,8 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Питання не знайдено")
                 return
 
+            compact_mode = self._compact_mode_for_question(question)
+
             raw = data.split(":", 1)[1]
             if question.type == "matching":
                 left_count = len(question.options) // 2 if len(question.options) // 2 else len(question.options)
@@ -3472,12 +3541,14 @@ class QuizBot:
                     self.api.edit_message_text(
                         chat_id,
                         message["message_id"],
-                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nСтан зіставлення скинуто.",
+                        (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nСтан зіставлення скинуто."
+                         + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
                         reply_markup=self._build_keyboard(
                             question.options,
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
+                            compact_mode=compact_mode,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], "Скинуто")
@@ -3514,32 +3585,37 @@ class QuizBot:
                         self.api.edit_message_text(
                             chat_id,
                             message["message_id"],
-                            f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}",
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
                             reply_markup=self._build_keyboard(
                                 (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                                 question_type="matching",
                                 matching_pairs=student.matching_pairs,
                                 matching_selected_left=student.matching_selected_left,
+                                compact_mode=compact_mode,
                             ),
                         )
                         self.api.answer_callback_query(callback_query["id"], "Знято вибір")
                         return
 
-                    student.matching_selected_left = index
-                    self._persist_students()
-                    self.api.edit_message_text(
-                        chat_id,
-                        message["message_id"],
-                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОберіть праву букву для {index + 1}.",
-                        reply_markup=self._build_keyboard(
-                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
-                            question_type="matching",
-                            matching_pairs=student.matching_pairs,
-                            matching_selected_left=student.matching_selected_left,
-                        ),
-                    )
-                    self.api.answer_callback_query(callback_query["id"], f"Обрано {index + 1}")
-                    return
+                    else:
+                        student.matching_selected_left = index
+                        self._persist_students()
+                        self.api.edit_message_text(
+                            chat_id,
+                            message["message_id"],
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
+                            reply_markup=self._build_keyboard(
+                                (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                                question_type="matching",
+                                matching_pairs=student.matching_pairs,
+                                matching_selected_left=student.matching_selected_left,
+                                compact_mode=compact_mode,
+                            ),
+                        )
+                        self.api.answer_callback_query(callback_query["id"], "Знято вибір")
+                        return
 
                 if side == "right":
                     if index < 0 or index >= right_count:
@@ -3578,6 +3654,8 @@ class QuizBot:
                         for left, right in sorted(student.matching_pairs.items())
                     ) or "нічого"
                     question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nПари: {pairs_text}"
+                    if compact_mode:
+                        question_text += f"\n\n{self._render_compact_options_text(question)}"
                     if all_paired:
                         question_text += "\n\n✅ Усі пари відмічено. Тепер доступне лише підтвердження або скидання."
 
@@ -3590,6 +3668,7 @@ class QuizBot:
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
+                            compact_mode=compact_mode,
                             matching_left_map=left_map,
                             matching_right_map=right_map,
                         ),
@@ -3621,8 +3700,24 @@ class QuizBot:
                     student.pending_multi_answers.append(original_selected)
                 self._persist_students()
                 chosen_text = ", ".join(question.options[i] for i in sorted(student.pending_multi_answers) if 0 <= i < len(question.options)) or "нічого"
+                compact_mode = self._compact_mode_for_question(question)
+                shuffled_options = [question.options[i] for i in student.shuffled_options]
                 updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОбрано: {chosen_text}"
-                self.api.edit_message_text(chat_id, message["message_id"], updated_text, reply_markup=self._build_keyboard([question.options[i] for i in student.shuffled_options], question_type="multi", selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
+                if compact_mode:
+                    opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
+                    updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nВаріанти:\n{opts_lines}\n\nОбрано: {chosen_text}"
+
+                self.api.edit_message_text(
+                    chat_id,
+                    message["message_id"],
+                    updated_text,
+                    reply_markup=self._build_keyboard(
+                        shuffled_options,
+                        question_type="multi",
+                        selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options},
+                        compact_mode=compact_mode,
+                    ),
+                )
                 self.api.answer_callback_query(callback_query["id"], f"Обрано: {chosen_text}")
                 return
             original_selected = student.shuffled_options[selected] if 0 <= selected < len(student.shuffled_options) else selected
