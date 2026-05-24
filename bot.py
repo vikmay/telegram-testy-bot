@@ -1447,6 +1447,7 @@ class QuizBot:
             student.current_test_duration_seconds = student.current_test_duration_seconds or self.test_duration_seconds
             if student.user_id in self.admin_user_ids and student.status in {"new", "awaiting_name", "pending_approval"}:
                 student.status = "approved"
+                student.awaiting_name = False
 
         # Populate persisted admin chat ids from already-loaded student states.
         # This fixes case when admins never pressed /start after last restart.
@@ -2053,7 +2054,9 @@ class QuizBot:
             if not target_student:
                 self.api.send_message(chat["id"], "Учня не знайдено.")
                 student.awaiting_admin_edit_last_name = False
+
                 student.awaiting_admin_edit_first_name = False
+
                 student.admin_edit_target_user_id = None
                 self._persist_students()
                 return
@@ -2077,6 +2080,11 @@ class QuizBot:
                 # Step 2: first name (given name)
                 target_student.first_name = cleaned
                 target_student.full_name = f"{target_student.last_name} {target_student.first_name}".strip()
+
+                # Auto-approval: if student was still onboarding step 2 (awaiting_name),
+                # promote them to approved immediately after admin enters PІБ.
+                target_student.status = "approved"
+                target_student.awaiting_name = False
 
                 student.awaiting_admin_edit_first_name = False
                 student.admin_edit_target_user_id = None
