@@ -24,7 +24,7 @@ jobs:
                       # ------------------------------------------------------------------
                       # BRANCH → BOT ROUTING
                       # ------------------------------------------------------------------
-                      BRANCH="${GITHUB_REF_NAME}"
+                      BRANCH="${{ github.ref_name }}"
 
                       if [ "$BRANCH" = "main" ]; then
                         REPO_DIR="/home/ubuntu/telegram-testy-bot"
