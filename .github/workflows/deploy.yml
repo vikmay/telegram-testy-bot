@@ -22,19 +22,12 @@ jobs:
                       set -euo pipefail
 
                       # ------------------------------------------------------------------
-                      # BRANCH → BOT ROUTING
+                      # BOT ROUTING (DONE ON GITHUB SIDE)
                       # ------------------------------------------------------------------
-                      BRANCH="${{ github.ref_name }}"
+                      REPO_DIR="${{ github.ref_name == 'main' && '/home/ubuntu/telegram-testy-bot' || '/home/ubuntu/telegram-testy-bot_2' }}"
+                      SERVICE_NAME="${{ github.ref_name == 'main' && 'telegram-testy-bot' || 'telegram-testy-bot_2' }}"
 
-                      if [ "$BRANCH" = "main" ]; then
-                        REPO_DIR="/home/ubuntu/telegram-testy-bot"
-                        SERVICE_NAME="telegram-testy-bot"
-                      else
-                        REPO_DIR="/home/ubuntu/telegram-testy-bot_2"
-                        SERVICE_NAME="telegram-testy-bot_2"
-                      fi
-
-                      echo "Deploying branch: $BRANCH → $SERVICE_NAME"
+                      echo "Deploying branch: ${{ github.ref_name }} → $SERVICE_NAME"
 
                       # ------------------------------------------------------------------
                       # SSH KEY FOR GIT
@@ -49,18 +42,18 @@ jobs:
                       export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
 
                       # ------------------------------------------------------------------
-                      # STOP SERVICE (IMPORTANT: avoid double run / Telegram conflict)
+                      # STOP SERVICE (PREVENT DUPLICATES / TELEGRAM CONFLICT)
                       # ------------------------------------------------------------------
                       sudo systemctl stop "$SERVICE_NAME" || true
 
                       # ------------------------------------------------------------------
-                      # REPO SYNC (clean + safe)
+                      # SAFE REPO SYNC
                       # ------------------------------------------------------------------
                       if [ -d "$REPO_DIR/.git" ]; then
                         cd "$REPO_DIR"
 
-                        git fetch origin "$BRANCH"
-                        git reset --hard "origin/$BRANCH"
+                        git fetch origin "${{ github.ref_name }}"
+                        git reset --hard "origin/${{ github.ref_name }}"
 
                         git clean -fd \
                           -e token.txt \
@@ -71,7 +64,7 @@ jobs:
                         rm -rf "$REPO_DIR"
                         git clone \
                           --depth 1 \
-                          --branch "$BRANCH" \
+                          --branch "${{ github.ref_name }}" \
                           "${{ secrets.REPO_SSH_URL }}" \
                           "$REPO_DIR"
                       fi
@@ -79,7 +72,7 @@ jobs:
                       cd "$REPO_DIR"
 
                       # ------------------------------------------------------------------
-                      # PRESERVE DATA (ONLY IF EXISTS)
+                      # PRESERVE DATA
                       # ------------------------------------------------------------------
                       QUESTIONS_BAK="$(mktemp)"
                       TOPICS_BAK="$(mktemp)"
@@ -89,14 +82,13 @@ jobs:
 
                       mkdir -p data
 
-                      # restore
                       [ -s "$QUESTIONS_BAK" ] && cp "$QUESTIONS_BAK" data/questions.json || true
                       [ -s "$TOPICS_BAK" ] && cp "$TOPICS_BAK" data/topics.json || true
 
                       rm -f "$QUESTIONS_BAK" "$TOPICS_BAK"
 
                       # ------------------------------------------------------------------
-                      # VENV (SAFE RECREATE IF BROKEN)
+                      # VENV (SAFE)
                       # ------------------------------------------------------------------
                       if [ ! -d "venv" ] || [ ! -x "venv/bin/python" ]; then
                         echo "Recreating venv..."
