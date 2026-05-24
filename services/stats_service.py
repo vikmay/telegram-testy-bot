@@ -192,6 +192,9 @@ class StatsService:
 
             # status icon
             status = self._safe_str(getattr(student, "status", ""))
+            if status == "awaiting_name":
+                full_name = "Учень вводить ПІБ"
+
             status_icon = (
                 "✅" if status == "approved" else
                 "⏳" if status == "pending_approval" else

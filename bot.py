@@ -1806,11 +1806,7 @@ class QuizBot:
             keyboard["inline_keyboard"].append(
                 [{"text": "🚫 Заблокувати", "callback_data": f"student:block:{student.user_id}"}]
             )
-        else:
-            keyboard["inline_keyboard"].append(
-                [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
-            )
-
+        elif student.status == "pending_approval":
             keyboard["inline_keyboard"].append(
                 [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
             )
