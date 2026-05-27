@@ -1,4 +1,4 @@
-name: Deploy Telegram Testy Bot
+name: Deploy Telegram Bots
 
 on:
     push:
@@ -11,8 +11,9 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
-            - name: Deploy to VM via SSH
-              uses: appleboy/ssh-action@v1.0.0
+            - name: Deploy to VM
+              uses: appleboy/ssh-action@v1.0.3
+
               with:
                   host: ${{ secrets.VM_HOST }}
                   username: ${{ secrets.VM_USER }}
@@ -21,91 +22,87 @@ jobs:
                   script: |
                       set -euo pipefail
 
-                      # ------------------------------------------------------------------
-                      # BOT ROUTING (DONE ON GITHUB SIDE)
-                      # ------------------------------------------------------------------
-                      REPO_DIR="${{ github.ref_name == 'main' && '/home/ubuntu/telegram-testy-bot' || '/home/ubuntu/telegram-testy-bot_2' }}"
-                      SERVICE_NAME="${{ github.ref_name == 'main' && 'telegram-testy-bot' || 'telegram-testy-bot_2' }}"
-
-                      echo "Deploying branch: ${{ github.ref_name }} → $SERVICE_NAME"
-
-                      # ------------------------------------------------------------------
-                      # SSH KEY FOR GIT
-                      # ------------------------------------------------------------------
-                      mkdir -p "$HOME/.ssh"
-                      DEPLOY_KEY_PATH="$HOME/.ssh/deploy_key"
-
-                      echo "${{ secrets.DEPLOY_KEY }}" > "$DEPLOY_KEY_PATH"
-                      chmod 600 "$DEPLOY_KEY_PATH"
-
-                      ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
-                      export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-
-                      # ------------------------------------------------------------------
-                      # STOP SERVICE (PREVENT DUPLICATES / TELEGRAM CONFLICT)
-                      # ------------------------------------------------------------------
-                      sudo systemctl stop "$SERVICE_NAME" || true
-
-                      # ------------------------------------------------------------------
-                      # SAFE REPO SYNC
-                      # ------------------------------------------------------------------
-                      if [ -d "$REPO_DIR/.git" ]; then
-                        cd "$REPO_DIR"
-
-                        git fetch origin "${{ github.ref_name }}"
-                        git reset --hard "origin/${{ github.ref_name }}"
-
-                        git clean -fd \
-                          -e token.txt \
-                          -e venv \
-                          -e "*.db" \
-                          -e "data"
+                      # ------------------------------------------------------------
+                      # ROUTING
+                      # ------------------------------------------------------------
+                      if [ "${{ github.ref_name }}" = "main" ]; then
+                        REPO_DIR="/home/ubuntu/telegram-testy-bot"
+                        SERVICE_NAME="telegram-testy-bot"
                       else
-                        rm -rf "$REPO_DIR"
-                        git clone \
-                          --depth 1 \
-                          --branch "${{ github.ref_name }}" \
-                          "${{ secrets.REPO_SSH_URL }}" \
-                          "$REPO_DIR"
+                        REPO_DIR="/home/ubuntu/telegram-testy-bot_2"
+                        SERVICE_NAME="telegram-testy-bot_2"
+                      fi
+
+                      echo "Deploying branch: ${{ github.ref_name }}"
+                      echo "Repo dir: $REPO_DIR"
+                      echo "Service: $SERVICE_NAME"
+
+                      # ------------------------------------------------------------
+                      # ENSURE REPO EXISTS
+                      # ------------------------------------------------------------
+                      if [ ! -d "$REPO_DIR/.git" ]; then
+                        echo "Repository not found"
+                        exit 1
                       fi
 
                       cd "$REPO_DIR"
 
-                      # ------------------------------------------------------------------
-                      # PRESERVE DATA
-                      # ------------------------------------------------------------------
-                      QUESTIONS_BAK="$(mktemp)"
-                      TOPICS_BAK="$(mktemp)"
+                      # ------------------------------------------------------------
+                      # STOP SERVICE
+                      # ------------------------------------------------------------
+                      sudo systemctl stop "$SERVICE_NAME" || true
 
-                      [ -f data/questions.json ] && cp data/questions.json "$QUESTIONS_BAK" || true
-                      [ -f data/topics.json ] && cp data/topics.json "$TOPICS_BAK" || true
+                      # ------------------------------------------------------------
+                      # UPDATE REPOSITORY
+                      # ------------------------------------------------------------
+                      git fetch origin
 
-                      mkdir -p data
+                      git reset --hard "origin/${{ github.ref_name }}"
 
-                      [ -s "$QUESTIONS_BAK" ] && cp "$QUESTIONS_BAK" data/questions.json || true
-                      [ -s "$TOPICS_BAK" ] && cp "$TOPICS_BAK" data/topics.json || true
+                      git clean -fd \
+                        -e venv \
+                        -e ".env" \
+                        -e "*.db" \
+                        -e "data"
 
-                      rm -f "$QUESTIONS_BAK" "$TOPICS_BAK"
-
-                      # ------------------------------------------------------------------
-                      # VENV (SAFE)
-                      # ------------------------------------------------------------------
+                      # ------------------------------------------------------------
+                      # VENV
+                      # ------------------------------------------------------------
                       if [ ! -d "venv" ] || [ ! -x "venv/bin/python" ]; then
-                        echo "Recreating venv..."
+                        echo "Creating venv..."
                         rm -rf venv
                         python3 -m venv venv
                       fi
 
-                      venv/bin/pip install --upgrade pip || true
+                      # ------------------------------------------------------------
+                      # INSTALL REQUIREMENTS
+                      # ------------------------------------------------------------
+                      venv/bin/pip install --upgrade pip
 
                       if [ -f requirements.txt ]; then
                         venv/bin/pip install -r requirements.txt
                       fi
 
-                      # ------------------------------------------------------------------
+                      # ------------------------------------------------------------
                       # START SERVICE
-                      # ------------------------------------------------------------------
-                      echo "Starting service: $SERVICE_NAME"
+                      # ------------------------------------------------------------
                       sudo systemctl restart "$SERVICE_NAME"
 
-                      echo "Deploy complete"
+                      # ------------------------------------------------------------
+                      # HEALTHCHECK
+                      # ------------------------------------------------------------
+                      sleep 5
+
+                      if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+                        echo "Service failed to start"
+
+                        echo "===== STATUS ====="
+                        sudo systemctl status "$SERVICE_NAME" --no-pager || true
+
+                        echo "===== LOGS ====="
+                        journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
+
+                        exit 1
+                      fi
+
+                      echo "Deploy complete ✔"
