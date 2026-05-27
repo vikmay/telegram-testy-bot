@@ -59,7 +59,11 @@ jobs:
 
                       git reset --hard "origin/${{ github.ref_name }}"
 
-                      git clean -fd
+                      git clean -fd \
+                        -e venv \
+                        -e ".env" \
+                        -e "*.db" \
+                        -e "data"
 
                       # ------------------------------------------------------------
                       # VENV
