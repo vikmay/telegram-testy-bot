@@ -2199,7 +2199,9 @@ class QuizBot:
         if user["id"] not in self.admin_user_ids:
             self.api.send_message(chat["id"], "Документ можуть імпортувати лише адміністратори.")
             return
-        if not student.awaiting_docx_import:
+        # Defensive import gating:
+        # DOCX import must happen ONLY when admin explicitly entered import mode AND selected a topic.
+        if not student.awaiting_docx_import or not student.awaiting_docx_topic_id:
             self.api.send_message(chat["id"], "Спочатку обери тему для імпорту DOCX.")
             return
         file_name = document.get("file_name", "")
@@ -3268,10 +3270,20 @@ class QuizBot:
                 return
 
         if data == "main_menu":
+            # Leaving any import-related UI: clear stale DOCX import flags.
+            student.awaiting_docx_import = False
+            student.awaiting_docx_topic_id = None
+            self._persist_students()
+
             self._show_main_menu(chat_id, user["id"])
             self.api.answer_callback_query(callback_query["id"], "Відкрито меню")
             return
         if data == "back_to_topics":
+            # Leaving any import-related UI: clear stale DOCX import flags.
+            student.awaiting_docx_import = False
+            student.awaiting_docx_topic_id = None
+            self._persist_students()
+
             self.api.send_message(chat_id, "Оберіть тему:", reply_markup=self._build_topics_keyboard())
             self.api.answer_callback_query(callback_query["id"], "Відкрито список тем")
             return
