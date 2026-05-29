@@ -1634,12 +1634,19 @@ class QuizBot:
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
             right_options = question.options[half:] if half else []
-            left_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(left_options))
+            left_lines = "\n".join(
+                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014]+\s*', '', str(opt)).strip()}"
+                for i, opt in enumerate(left_options)
+            )
             right_lines = "\n".join(
-                f"{chr(ord('a') + i)}) {opt}" for i, opt in enumerate(right_options)
+                f"{chr(ord('a') + i)}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                for i, opt in enumerate(right_options)
             )
             return f"Ліва колонка:\n{left_lines}\n\nПрава колонка:\n{right_lines}"
-        lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(question.options or []))
+        lines = "\n".join(
+                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+            for i, opt in enumerate(question.options or [])
+        )
         return f"Варіанти:\n{lines}"
 
     def _get_topics(self) -> List[Topic]:
@@ -2629,9 +2636,13 @@ class QuizBot:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
             if compact_mode:
-                opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
+                opts_lines = "\n".join(
+                    f"{i + 1}) {re.sub(r'^[\s\.\:\-•\u2013\u2014]+\s*', '', str(opt)).strip()}"
+                    for i, opt in enumerate(shuffled_options)
+                )
                 text += f"\n\nВаріанти:\n{opts_lines}"
-            text += "\n\nВибрано: нічого"
+            if question.type == "matching":
+                text += "\n\nВибрано: нічого"
             sent_message = self.api.send_message(
                 student.chat_id,
                 text,
@@ -2646,7 +2657,10 @@ class QuizBot:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
             if compact_mode:
-                opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
+                opts_lines = "\n".join(
+                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                    for i, opt in enumerate(shuffled_options)
+                )
                 text += f"\n\nВаріанти:\n{opts_lines}"
             sent_message = self.api.send_message(
                 student.chat_id,
@@ -3711,13 +3725,24 @@ class QuizBot:
                 else:
                     student.pending_multi_answers.append(original_selected)
                 self._persist_students()
-                chosen_text = ", ".join(question.options[i] for i in sorted(student.pending_multi_answers) if 0 <= i < len(question.options)) or "нічого"
+                # Keep selection visible via highlighted buttons/checkboxes, not by re-rendering the selected text.
                 compact_mode = self._compact_mode_for_question(question)
                 shuffled_options = [question.options[i] for i in student.shuffled_options]
-                updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОбрано: {chosen_text}"
+
+                updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+
+                # Preserve timer line on every answer click.
+                if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
+                    elapsed = int(time.time() - float(student.current_test_started_at))
+                    remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
+                    updated_text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+
                 if compact_mode:
-                    opts_lines = "\n".join(f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_options))
-                    updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nВаріанти:\n{opts_lines}\n\nОбрано: {chosen_text}"
+                    opts_lines = "\n".join(
+f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                        for i, opt in enumerate(shuffled_options)
+                    )
+                    updated_text += f"\n\nВаріанти:\n{opts_lines}"
 
                 self.api.edit_message_text(
                     chat_id,
@@ -3730,7 +3755,7 @@ class QuizBot:
                         compact_mode=compact_mode,
                     ),
                 )
-                self.api.answer_callback_query(callback_query["id"], f"Обрано: {chosen_text}")
+                self.api.answer_callback_query(callback_query["id"], "Вибір збережено")
                 return
             original_selected = student.shuffled_options[selected] if 0 <= selected < len(student.shuffled_options) else selected
             self._grade_question(student, {original_selected})
