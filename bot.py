@@ -2595,10 +2595,13 @@ class QuizBot:
             self._finish_test_due_to_timeout(student)
             return
         text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+        timer_line = ""
         if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
             elapsed = int(time.time() - float(student.current_test_started_at))
             remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
-            text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+            timer_line = f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+            if question.type != "matching":
+                text += timer_line
 
         compact_mode = self._compact_mode_for_question(question)
 
@@ -2615,7 +2618,7 @@ class QuizBot:
             block_lines.append("")
             block_lines.append("Права колонка:")
             block_lines.extend([f"{chr(ord('a') + i)}. {opt}" for i, opt in enumerate(shuffled_right_options)])
-            text += "\n\nЗістав пари: натискай спочатку лівий номер, потім праву букву. Пару можна змінювати до підтвердження.\n\n" + "\n".join(block_lines)
+            text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\n" + "\n".join(block_lines) + "\n\nПари: нічого"
             student.matching_pairs = {}
             student.matching_selected_left = None
             sent_message = self.api.send_message(
@@ -3548,6 +3551,12 @@ class QuizBot:
 
             compact_mode = self._compact_mode_for_question(question)
 
+            timer_line = ""
+            if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
+                elapsed = int(time.time() - float(student.current_test_started_at))
+                remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
+                timer_line = f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+
             raw = data.split(":", 1)[1]
             if question.type == "matching":
                 left_count = len(question.options) // 2 if len(question.options) // 2 else len(question.options)
@@ -3571,8 +3580,9 @@ class QuizBot:
                     self.api.edit_message_text(
                         chat_id,
                         message["message_id"],
-                        (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nСтан зіставлення скинуто."
-                         + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
+                        (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                         + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")
+                         + f"\n\nПари скинуто"),
                         reply_markup=self._build_keyboard(
                             question.options,
                             question_type="matching",
@@ -3612,11 +3622,16 @@ class QuizBot:
                     if student.matching_selected_left == index:
                         student.matching_selected_left = None
                         self._persist_students()
+                        pairs_text = ", ".join(
+                            str(left + 1) + chr(ord("a") + right)
+                            for left, right in sorted(student.matching_pairs.items())
+                        ) or "нічого"
                         self.api.edit_message_text(
                             chat_id,
                             message["message_id"],
-                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
-                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")
+                             + f"\n\nПари: {pairs_text}"),
                             reply_markup=self._build_keyboard(
                                 (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                                 question_type="matching",
@@ -3631,11 +3646,16 @@ class QuizBot:
                     else:
                         student.matching_selected_left = index
                         self._persist_students()
+                        pairs_text = ", ".join(
+                            str(left + 1) + chr(ord("a") + right)
+                            for left, right in sorted(student.matching_pairs.items())
+                        ) or "нічого"
                         self.api.edit_message_text(
                             chat_id,
                             message["message_id"],
-                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
-                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")),
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                             + (f"\n\n{self._render_compact_options_text(question)}" if compact_mode else "")
+                              + f"\n\nПари: {pairs_text}"),
                             reply_markup=self._build_keyboard(
                                 (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
                                 question_type="matching",
@@ -3683,11 +3703,12 @@ class QuizBot:
                         f"{left + 1}{chr(ord('a') + right)}"
                         for left, right in sorted(student.matching_pairs.items())
                     ) or "нічого"
-                    question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nПари: {pairs_text}"
+                    question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
                     if compact_mode:
                         question_text += f"\n\n{self._render_compact_options_text(question)}"
                     if all_paired:
                         question_text += "\n\n✅ Усі пари відмічено. Тепер доступне лише підтвердження або скидання."
+                    question_text += f"\n\nПари: {pairs_text}"
 
                     self.api.edit_message_text(
                         chat_id,
