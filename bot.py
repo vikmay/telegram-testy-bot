@@ -1630,21 +1630,23 @@ class QuizBot:
             return False
 
     def _render_compact_options_text(self, question: Question) -> str:
+        matching_left_pattern = r'^[\s\.\:\-\u2013\u2014]+\s*'
+        options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
         if question.type == "matching":
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
             right_options = question.options[half:] if half else []
             left_lines = "\n".join(
-                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014]+\s*', '', str(opt)).strip()}"
+                    f"{i + 1}) {re.sub(matching_left_pattern, '', str(opt)).strip()}"
                 for i, opt in enumerate(left_options)
             )
             right_lines = "\n".join(
-                f"{chr(ord('a') + i)}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                f"{chr(ord('a') + i)}) {re.sub(options_pattern, '', str(opt)).strip()}"
                 for i, opt in enumerate(right_options)
             )
             return f"Ліва колонка:\n{left_lines}\n\nПрава колонка:\n{right_lines}"
         lines = "\n".join(
-                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                    f"{i + 1}) {re.sub(options_pattern, '', str(opt)).strip()}"
             for i, opt in enumerate(question.options or [])
         )
         return f"Варіанти:\n{lines}"
@@ -2636,8 +2638,9 @@ class QuizBot:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
             if compact_mode:
+                compact_multi_pattern = r'^[\s\.\:\-•\u2013\u2014]+\s*'
                 opts_lines = "\n".join(
-                    f"{i + 1}) {re.sub(r'^[\s\.\:\-•\u2013\u2014]+\s*', '', str(opt)).strip()}"
+                    f"{i + 1}) {re.sub(compact_multi_pattern, '', str(opt)).strip()}"
                     for i, opt in enumerate(shuffled_options)
                 )
                 text += f"\n\nВаріанти:\n{opts_lines}"
@@ -2657,8 +2660,9 @@ class QuizBot:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
             if compact_mode:
+                compact_options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
                 opts_lines = "\n".join(
-                    f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                    f"{i + 1}) {re.sub(compact_options_pattern, '', str(opt)).strip()}"
                     for i, opt in enumerate(shuffled_options)
                 )
                 text += f"\n\nВаріанти:\n{opts_lines}"
@@ -3738,8 +3742,9 @@ class QuizBot:
                     updated_text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
 
                 if compact_mode:
+                    compact_options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
                     opts_lines = "\n".join(
-f"{i + 1}) {re.sub(r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*', '', str(opt)).strip()}"
+                        f"{i + 1}) {re.sub(compact_options_pattern, '', str(opt)).strip()}"
                         for i, opt in enumerate(shuffled_options)
                     )
                     updated_text += f"\n\nВаріанти:\n{opts_lines}"
