@@ -2871,7 +2871,10 @@ class QuizBot:
             block_lines.append("")
             block_lines.append("Права колонка:")
             block_lines.extend([f"{chr(ord('a') + i)}) {opt}" for i, opt in enumerate(shuffled_right_options)])
-            text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\n" + "\n".join(block_lines) + "\n\nПари: нічого"
+            if compact_mode:
+                text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\n" + "\n".join(block_lines) + "\n\nПари: нічого"
+            else:
+                text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\nПари: нічого"
             student.matching_pairs = {}
             student.matching_selected_left = None
             sent_message = self.api.send_message(
