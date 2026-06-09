@@ -1411,6 +1411,10 @@ class QuizBot:
             if current is None:
                 continue
 
+            # Пропускаємо заголовки колонок у matching-питаннях
+            if re.match(r"^(Лівий стовпець|Права колонка|Ліва колонка|Відповідність)[\s:]*", line, re.IGNORECASE):
+                continue
+
             if (m := x_pat.match(line)):
                 current["type"] = parse_question_type(m.group(1))
                 continue
