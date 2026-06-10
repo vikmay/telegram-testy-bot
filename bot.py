@@ -3868,9 +3868,8 @@ class QuizBot:
 
                 if raw == "submit":
                     # Convert shuffled indices back to original indices for grading
-                    inverse_left_map = {shuffled: orig for orig, shuffled in enumerate(left_map)}
-                    inverse_right_map = {shuffled: orig for orig, shuffled in enumerate(right_map)}
-                    pairs = [(inverse_left_map.get(left, left) + 1, inverse_right_map.get(right, right) + 1) for left, right in sorted(student.matching_pairs.items())]
+                    # left_map[callback_idx] = original_index for left, right_map similarly for right
+                    pairs = [(left_map[left] + 1, right_map[right] + 1) for left, right in sorted(student.matching_pairs.items())]
                     self._grade_matching_question(student, pairs)
                     student.matching_pairs = {}
                     student.matching_selected_left = None
