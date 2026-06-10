@@ -1411,6 +1411,10 @@ class QuizBot:
             if current is None:
                 continue
 
+            # Пропускаємо заголовки колонок у matching-питаннях
+            if re.match(r"^(Лівий стовпець|Права колонка|Ліва колонка|Відповідність)[\s:]*", line, re.IGNORECASE):
+                continue
+
             if (m := x_pat.match(line)):
                 current["type"] = parse_question_type(m.group(1))
                 continue
@@ -3852,8 +3856,20 @@ class QuizBot:
                     self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
                     return
             if question.type == "matching":
+                half = len(question.options) // 2
+                left_count = half if half else len(question.options)
+                right_count = len(question.options) - left_count
+                left_map = student.shuffled_matching_left if student.shuffled_matching_left else list(range(left_count))
+                right_map = student.shuffled_matching_right if student.shuffled_matching_right else list(range(right_count))
+                left_options = question.options[:half] if half else question.options
+                right_options = question.options[half:] if half else []
+                shuffled_left_options = [left_options[i] for i in left_map if 0 <= i < len(left_options)]
+                shuffled_right_options = [right_options[i] for i in right_map if 0 <= i < len(right_options)]
+
                 if raw == "submit":
-                    pairs = [(left + 1, right + 1) for left, right in sorted(student.matching_pairs.items())]
+                    # Convert shuffled indices back to original indices for grading
+                    # left_map[callback_idx] = original_index for left, right_map similarly for right
+                    pairs = [(left_map[left] + 1, right_map[right] + 1) for left, right in sorted(student.matching_pairs.items())]
                     self._grade_matching_question(student, pairs)
                     student.matching_pairs = {}
                     student.matching_selected_left = None
@@ -3869,18 +3885,6 @@ class QuizBot:
                     student.matching_selected_left = None
                     self._persist_students()
 
-                    half = len(question.options) // 2
-                    left_count = half if half else len(question.options)
-                    right_count = len(question.options) - left_count
-                    left_map = student.shuffled_matching_left if student.shuffled_matching_left else list(range(left_count))
-                    right_map = student.shuffled_matching_right if student.shuffled_matching_right else list(range(right_count))
-
-                    left_options = question.options[:half] if half else question.options
-                    right_options = question.options[half:] if half else []
-
-                    shuffled_left_options = [left_options[i] for i in left_map if 0 <= i < len(left_options)]
-                    shuffled_right_options = [right_options[i] for i in right_map if 0 <= i < len(right_options)]
-
                     self.api.edit_message_text(
                         chat_id,
                         message["message_id"],
@@ -3893,6 +3897,8 @@ class QuizBot:
                             matching_pairs={},
                             matching_selected_left=None,
                             compact_mode=compact_mode,
+                            matching_left_map=left_map,
+                            matching_right_map=right_map,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], "Скинуто")
@@ -3937,7 +3943,7 @@ class QuizBot:
                               + (f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}" if compact_mode else "")
                              + f"\n\nПари: {pairs_text}"),
                             reply_markup=self._build_keyboard(
-                                (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                                shuffled_left_options + shuffled_right_options,
                                 question_type="matching",
                                 matching_pairs=student.matching_pairs,
                                 matching_selected_left=student.matching_selected_left,
@@ -3961,7 +3967,7 @@ class QuizBot:
                              + (f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}" if compact_mode else "")
                               + f"\n\nПари: {pairs_text}"),
                             reply_markup=self._build_keyboard(
-                                (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                                shuffled_left_options + shuffled_right_options,
                                 question_type="matching",
                                 matching_pairs=student.matching_pairs,
                                 matching_selected_left=student.matching_selected_left,
@@ -4019,13 +4025,11 @@ class QuizBot:
                         message["message_id"],
                         question_text,
                         reply_markup=self._build_keyboard(
-                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                            shuffled_left_options + shuffled_right_options,
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
                             compact_mode=compact_mode,
-                            matching_left_map=left_map,
-                            matching_right_map=right_map,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], f"Пара: {pairs_text}")
