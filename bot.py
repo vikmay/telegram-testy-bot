@@ -1808,14 +1808,14 @@ class QuizBot:
                     if compact_mode:
                         left_label = f"{left_mark}{index + 1}".strip()
                     else:
-                        left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 22)}"
+                        left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 40)}"
                     row.append({"text": left_label, "callback_data": f"answer:left:{index}"})
                 if index < len(right_options):
                     right_mark = "✅ " if index in matching_pairs.values() else ""
                     if compact_mode:
                         right_label = f"{right_mark}{chr(ord('a') + index)}".strip()
                     else:
-                        right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 22)}"
+                        right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 40)}"
                     row.append({"text": right_label, "callback_data": f"answer:right:{index}"})
                 keyboard.append(row)
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
@@ -1845,7 +1845,7 @@ class QuizBot:
     def _compact_mode_for_question(self, question: Question) -> bool:
         if question.type == "text":
             return False
-        threshold = 32
+        threshold = 24
         try:
             return any(len(str(opt)) > threshold for opt in (question.options or []) if opt is not None)
         except Exception:
