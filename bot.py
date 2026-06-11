@@ -1191,8 +1191,7 @@ class QuizBot:
             if rels_path in archive.namelist():
                 rels_xml = archive.read(rels_path)
                 rel_root = ET.fromstring(rels_xml)
-                rns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
-                for rel in rel_root.findall(".//rel:Relationship", {"rel": rns["r"]}):
+                for rel in rel_root.findall(".//{*}Relationship"):
                     rid = rel.get("Id")
                     target = rel.get("Target")
                     if not rid or not target:
@@ -1224,7 +1223,8 @@ class QuizBot:
                 markers_in_paragraph: List[str] = []
 
                 for blip in blips:
-                    embed_rid = blip.get(f"{{{ns['r']}}}embed")
+                    # Check both r:embed and r:id for broader compatibility
+                    embed_rid = blip.get(f"{{{ns['r']}}}embed") or blip.get(f"{{{ns['r']}}}id")
                     if not embed_rid:
                         continue
 
@@ -1257,7 +1257,8 @@ class QuizBot:
                         saved_path.write_bytes(img_bytes)
 
                         images_by_marker[marker_id] = {
-                            "path": str(saved_path),
+                            # Store path relative to DATA_DIR for portability
+                            "path": str(saved_path.relative_to(DATA_DIR)),
                             "position": "top",
                             "caption": None,
                         }
@@ -1338,8 +1339,26 @@ class QuizBot:
                 return "text"
             return cleaned or "single"
 
+        # Buffer for images that appear BEFORE any question (current is None).
+        pending_images: List[dict] = []
+
+        def attach_pending_images(target: Dict[str, object]):
+            """Attach buffered pending images to a newly created question dict."""
+            nonlocal pending_images
+            if not pending_images:
+                return
+            # Pick the best image (prefer "top" position).
+            best_img = pending_images[0]
+            for img in pending_images[1:]:
+                if str(img.get("position", "")).strip().lower() == "top":
+                    best_img = img
+                    break
+            target["image"] = best_img
+            pending_images = []
+
         def flush():
             nonlocal current
+            nonlocal pending_images
             if not current:
                 return
             question_text = str(current.get("question", "")).strip()
@@ -1357,36 +1376,42 @@ class QuizBot:
                         options=options,
                         answer=answer,
                         explanation=str(current.get("explanation", "")),
+                        image=current.get("image"),  # preserve any already-attached image
                     )
                 )
             current = None
 
         for line in lines:
+            # 1. Parse and extract images from the line first
+            line_images = []
             if images_by_marker and "[[IMG" in line:
                 marker_ids = [int(x) for x in re.findall(r"\[\[IMG(\d+)\]\]", line)]
+                
+                try:
+                    with open(DATA_DIR / "debug_import.log", "a", encoding="utf-8") as f:
+                        f.write(f"\n--- LOOKUP DEBUG ---\n")
+                        f.write(f"Original line: {line}\n")
+                        f.write(f"Extracted marker_ids: {marker_ids}\n")
+                        f.write(f"images_by_marker keys: {[(type(k), k) for k in images_by_marker.keys()]}\n")
+                except Exception:
+                    pass
+
                 line = re.sub(r"\[\[IMG\d+\]\]", "", line).strip()
 
-                if current is not None and marker_ids:
-                    for marker_id in marker_ids:
-                        new_img = images_by_marker.get(marker_id)
-                        if not isinstance(new_img, dict):
-                            continue
+                for marker_id in marker_ids:
+                    # Support lookup by both int and string key for safety
+                    new_img = images_by_marker.get(marker_id) or images_by_marker.get(str(marker_id))
+                    
+                    try:
+                        with open(DATA_DIR / "debug_import.log", "a", encoding="utf-8") as f:
+                            f.write(f"Looking up {marker_id}: found={new_img is not None}\n")
+                    except Exception:
+                        pass
+                        
+                    if isinstance(new_img, dict):
+                        line_images.append(new_img)
 
-                        old_img = current.get("image")
-                        old_pos = (
-                            str(old_img.get("position", "")).strip().lower() if isinstance(old_img, dict) else ""
-                        )
-                        new_pos = str(new_img.get("position", "")).strip().lower()
-
-                        # Prefer "top" image when multiple markers are present.
-                        if old_pos != "top" and new_pos == "top":
-                            current["image"] = new_img
-                        elif not isinstance(old_img, dict) or old_pos != "top":
-                            current["image"] = new_img
-
-                if not line:
-                    continue
-
+            # 2. Check for topic line
             if (m := t_pat.match(line)):
                 name = m.group(1).strip()
                 topic = self._find_topic_by_name(name)
@@ -1394,6 +1419,7 @@ class QuizBot:
                     active_topic_id = topic.id
                 continue
 
+            # 3. Check for new question match
             match = q_pat.match(line)
             if match:
                 flush()
@@ -1406,6 +1432,37 @@ class QuizBot:
                     "answer": [],
                     "explanation": "",
                 }
+                # Attach images found on this new question line
+                pending_images.extend(line_images)
+                attach_pending_images(current)
+                
+                if not line:
+                    continue
+                continue
+
+            # 4. If it's not a new question, attach line images to current active question or buffer them
+            if line_images:
+                is_current_done = False
+                if current is not None:
+                    if current.get("options") or current.get("answer") or current.get("explanation"):
+                        is_current_done = True
+
+                if current is not None and not is_current_done:
+                    for new_img in line_images:
+                        old_img = current.get("image")
+                        old_pos = (
+                            str(old_img.get("position", "")).strip().lower() if isinstance(old_img, dict) else ""
+                        )
+                        new_pos = str(new_img.get("position", "")).strip().lower()
+
+                        if old_pos != "top" and new_pos == "top":
+                            current["image"] = new_img
+                        elif not isinstance(old_img, dict) or old_pos != "top":
+                            current["image"] = new_img
+                else:
+                    pending_images.extend(line_images)
+
+            if not line:
                 continue
 
             if current is None:
@@ -1486,9 +1543,32 @@ class QuizBot:
     def _load_questions_from_docx(self) -> List[Question]:
         return []
 
-    def _load_questions_from_uploaded_docx(self, path: Path, fallback_topic_id: str = "") -> List[Question]:
+    # This method extracts text and images from a DOCX and parses them into Question objects.
+    # It was previously missing or incorrectly defined, leading to AttributeError.
+    def _load_questions_from_uploaded_docx(self, path: Path, topic_id: str = "") -> List[Question]:
         extracted_text, images_by_marker = self._extract_docx_text_with_images(path)
-        return self._parse_docx_questions(extracted_text, topic_id=fallback_topic_id, images_by_marker=images_by_marker)
+        debug_log = DATA_DIR / "debug_import.log"
+        try:
+            with open(debug_log, "w", encoding="utf-8") as f:
+                f.write(f"=== SHA256 PREFIX ===\n{hashlib.sha256(path.read_bytes()).hexdigest()[:16]}\n\n")
+                f.write("=== IMAGES BY MARKER ===\n")
+                f.write(json.dumps(images_by_marker, indent=2, ensure_ascii=False) + "\n\n")
+                f.write("=== EXTRACTED TEXT ===\n")
+                f.write(extracted_text + "\n")
+        except Exception as e:
+            print(f"Failed to write debug log: {e}")
+        
+        parsed = self._parse_docx_questions(extracted_text, topic_id=topic_id, images_by_marker=images_by_marker)
+        
+        try:
+            with open(debug_log, "a", encoding="utf-8") as f:
+                f.write("\n=== PARSED QUESTIONS ===\n")
+                for q in parsed:
+                    f.write(f"ID: {q.id}, Q: {q.question[:40]}, Image: {q.image}\n")
+        except Exception as e:
+            print(f"Failed to append debug log: {e}")
+            
+        return parsed
 
     def _save_imported_questions(self, imported: List[Question]) -> Tuple[int, int]:
         existing_ids = {question.id for question in self.questions}
@@ -1964,10 +2044,37 @@ class QuizBot:
 
     def _delete_questions_by_filter(self, predicate) -> int:
         before = len(self.questions)
+        to_delete = [q for q in self.questions if predicate(q)]
         self.questions = [question for question in self.questions if not predicate(question)]
         deleted = before - len(self.questions)
         if deleted <= 0:
             return 0
+
+        # Clean up deleted question images
+        # Build set of image paths referenced by the remaining questions to avoid deleting shared images
+        remaining_image_paths = set()
+        for q in self.questions:
+            if isinstance(getattr(q, "image", None), dict):
+                path = q.image.get("path")
+                if path:
+                    remaining_image_paths.add(path)
+
+        for q in to_delete:
+            if isinstance(getattr(q, "image", None), dict):
+                path = q.image.get("path")
+                if path and path not in remaining_image_paths:
+                    full_path = DATA_DIR / path
+                    try:
+                        if full_path.exists():
+                            full_path.unlink()
+                            # If the parent directory (e.g. data/docx_images/sha) is empty, remove it too
+                            parent_dir = full_path.parent
+                            if parent_dir.exists() and parent_dir.name != "docx_images":
+                                if not any(parent_dir.iterdir()):
+                                    parent_dir.rmdir()
+                    except Exception as exc:
+                        print(f"Failed to delete image {full_path}: {exc}")
+
         self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation, "image": q.image} for q in self.questions])
         return deleted
 
@@ -2493,9 +2600,6 @@ class QuizBot:
             },
         )
 
-    def _load_questions_from_uploaded_docx(self, path: Path, topic_id: str = "") -> List[Question]:
-        return self._parse_docx_questions(self._extract_docx_text(path), topic_id=topic_id)
-
     def _send_admin_help(self, chat_id: int):
         lines = [
             "Команди адміністратора:",
@@ -2841,8 +2945,13 @@ class QuizBot:
         photo_caption = None
         if image_meta:
             photo_position = str(image_meta.get("position", "top")).strip().lower() or "top"
-            photo_path = image_meta.get("path")
+            raw_path = image_meta.get("path")
             photo_caption = image_meta.get("caption")
+            if raw_path:
+                # Resolve path relative to DATA_DIR
+                photo_path = DATA_DIR / raw_path
+                if not photo_path.exists():
+                    photo_path = None
 
         if photo_position == "top" and photo_path:
             try:
