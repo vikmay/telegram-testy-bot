@@ -2202,6 +2202,10 @@ class QuizBot:
             keyboard["inline_keyboard"].append(
                 [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
             )
+        elif student.status == "blocked":
+            keyboard["inline_keyboard"].append(
+                [{"text": "✅ Розблокувати", "callback_data": f"student:unblock:{student.user_id}"}]
+            )
         keyboard["inline_keyboard"].append(
             [{"text": "✏️ Редагувати ім’я/прізвище", "callback_data": f"admin:edit_student_name:{student.user_id}"}]
         )
@@ -3865,6 +3869,41 @@ class QuizBot:
             self._persist_students()
             self._show_student_details(chat_id, target_student)
             self.api.answer_callback_query(callback_query["id"], "Учня заблоковано")
+            return
+        if data.startswith("student:unblock:"):
+            if user["id"] not in self.admin_user_ids:
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+
+            target_id_raw = data.split(":", 2)[2]
+            try:
+                target_id_int = int(target_id_raw)
+                target_id = str(target_id_int)
+            except (TypeError, ValueError):
+                target_id_int = None
+                target_id = target_id_raw
+
+            target_student = self.students.get(target_id)
+            if not target_student:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+                return
+
+            target_student.status = "approved"
+            self._persist_students()
+            self._show_student_details(chat_id, target_student)
+
+            # notify student
+            if getattr(target_student, "chat_id", None) is not None:
+                try:
+                    self.api.send_message(
+                        target_student.chat_id,
+                        "Твій акаунт розблоковано. Доступ відкрито.",
+                        reply_markup=self._build_back_to_main_keyboard(),
+                    )
+                except RuntimeError as exc:
+                    print(f"[student unblock notify] failed chat_id={target_student.chat_id}: {exc}")
+
+            self.api.answer_callback_query(callback_query["id"], "Учня розблоковано")
             return
         if data.startswith("student:delete:"):
             if user["id"] not in self.admin_user_ids:
