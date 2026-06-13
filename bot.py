@@ -2527,7 +2527,7 @@ class QuizBot:
                     reply_markup={
                         "inline_keyboard": [
                             [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}],
-                            [{"text": "🚫 Відхилити", "callback_data": f"student:block:{student.user_id}"}],
+                            [{"text": "🚫 Відхилити", "callback_data": f"student:reject:{student.user_id}"}],
                         ]
                     },
                 )
@@ -3817,7 +3817,13 @@ class QuizBot:
                 return
             target_id = data.split(":", 2)[2]
             target_student = self.students.get(target_id)
-            if target_student:
+            if target_student and target_student.status != "deleted":
+                # Ensure the student is actually pending approval — don't approve
+                # a student who was rejected and then re-created by /start without
+                # re-entering their name (issue: tombstone is cleared early in _handle_start).
+                if target_student.status != "pending_approval":
+                    self.api.answer_callback_query(callback_query["id"], "Учень не очікує схвалення")
+                    return
                 target_student.status = "approved"
                 self._persist_students()
                 self._show_student_details(chat_id, target_student)
@@ -3837,7 +3843,9 @@ class QuizBot:
                 self._notify_admins(
                     f"✅ Учня схвалено: {target_student.full_name or f'Учень {target_student.user_id}'} (ID: {target_student.user_id})"
                 )
-            self.api.answer_callback_query(callback_query["id"], "Учня схвалено")
+                self.api.answer_callback_query(callback_query["id"], "Учня схвалено")
+            else:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
             return
         if data.startswith("student:block:"):
             if user["id"] not in self.admin_user_ids:
@@ -3869,6 +3877,54 @@ class QuizBot:
             self._persist_students()
             self._show_student_details(chat_id, target_student)
             self.api.answer_callback_query(callback_query["id"], "Учня заблоковано")
+            return
+        if data.startswith("student:reject:"):
+            if user["id"] not in self.admin_user_ids:
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+
+            target_id_raw = data.split(":", 2)[2]
+            try:
+                target_id_int = int(target_id_raw)
+                target_id = str(target_id_int)
+            except (TypeError, ValueError):
+                target_id_int = None
+                target_id = target_id_raw
+
+            target_student = self.students.get(target_id)
+            if not target_student:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+                return
+
+            if target_id in self.students:
+                del self.students[target_id]
+            if target_id_int is not None:
+                self.sessions_store.delete_student(target_id_int)
+                self.results_store.delete_student_history(target_id_int)
+            self.deleted_student_keys.add(target_id)
+            self._persist_state()
+            self._persist_students()
+
+            self.api.edit_message_text(
+                chat_id=chat_id,
+                message_id=message["message_id"],
+                text=f"🚫 Запит від учня {target_student.full_name or target_id} відхилено і видалено.",
+                reply_markup={"inline_keyboard": []}
+            )
+            self.api.answer_callback_query(callback_query["id"], "Запит відхилено")
+            
+            if getattr(target_student, "chat_id", None) is not None:
+                try:
+                    self.api.send_message(
+                        target_student.chat_id,
+                        "Твій запит було відхилено адміністратором."
+                    )
+                except RuntimeError as exc:
+                    print(f"[student reject notify] failed chat_id={target_student.chat_id}: {exc}")
+            
+            self._notify_admins(
+                f"🚫 Запит учня відхилено: {target_student.full_name or f'Учень {target_student.user_id}'} (ID: {target_student.user_id})"
+            )
             return
         if data.startswith("student:unblock:"):
             if user["id"] not in self.admin_user_ids:
