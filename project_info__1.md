@@ -1,262 +1,252 @@
-# telegram-testy-bot — Codebase Overview + Flow “new student → approval”
+# Matching questions (DOCX import → parsing → Telegram render) — Codebase Overview
 
 ## Summary
 
-Це Telegram-бот на Python (`bot.py`), який дає студентам проходити topic-based тести з автоперевіркою (single/multi/matching) і накопичує результати в SQLite (`results.db`). Для доступу студент проходить онбординг через `/start` (прізвище → ім’я), а далі його статус “chekкає” адміністратор: без схвалення тести недоступні. Адмін керує учнями через inline-кнопки або команди (`/students`, `/approve <user_id>`) і може схвалити/заблокувати доступ.
-
-Нижче — покроково саме Flow створення нового учня від початку заявки до його схвалення.
+This repository is a single-file Telegram bot (`bot.py`) that runs a math quiz with multiple question types, including `matching` (pair matching). For admins, `matching` questions are imported from `.docx` files: the bot extracts Word XML text, parses question blocks into the internal `Question` model, and stores them in `data/questions.json`. For students, `matching` questions are rendered as an inline keyboard with a two-column selection flow (pick left number → pick right letter), then submitted and graded against the imported/parsed `question.answer`.
 
 ## Architecture
 
-**Патерн/стиль:** “single-binary” / монолітний бот: майже вся логіка зібрана в `bot.py`, а статистика винесена в `services/stats_service.py`.  
-**Технології:**
+**Primary pattern:** “single-process Telegram bot controller” with all orchestration living in `QuizBot` inside `bot.py`, plus a stats helper in `services/stats_service.py`.
 
-- Python 3.10+ (стандартна бібліотека)
-- Telegram Bot API через прямі HTTP виклики (`urllib`)
-- JSON-файли в `data/` для довготривалих станів/довідників (`students.json`, `topics.json`, `state.json`, тощо)
-- SQLite в корені для історії/агрегацій (`results.db`) та для state діалогу (`sessions.db`)
+**Major subsystems:**
 
-**Як стартує виконання / runtime loop:**
+- **Persistence layer**
+    - JSON files in `data/` (`questions.json`, `students.json`, `topics.json`, `state.json`)
+    - SQLite DBs in project root (`results.db`, `sessions.db`)
+- **Bot runtime / orchestration**
+    - `QuizBot.run()` long-poll loop: `getUpdates()` → `process_update()`
+    - Message routing by update type:
+        - `message` (text or docx)
+        - `callback_query` (inline keyboard button presses)
+- **DOCX import pipeline (admin-only)**
+    - Extract Word XML text + inline images: `_extract_docx_text_with_images()`
+    - Parse document into question blocks: `_parse_docx_questions()`
+- **Matching question runtime (student)**
+    - Render matching UI and shuffle columns: `_send_current_question()` + `_build_keyboard()`
+    - Parse “student free-text answer” (fallback): `_parse_matching_answer()`
+    - Grade pairs: `_grade_matching_question()`
 
-1. `main()` → `ensure_default_files()` → `QuizBot()` → `bot.run()`
-2. `QuizBot.run()` робить нескінченний polling:
-    - `updates = api.get_updates(offset)`
-    - `_check_and_send_reminders()` (опційно)
-    - `for update in updates: process_update(update)`
-3. `process_update()` маршрутизує:
-    - `message` → `_handle_start`, `_handle_text`, `_handle_document`, або `_handle_admin_command`
-    - `callback_query` → `_handle_callback`
+**Execution start:**
+
+- `main()` → `ensure_default_files()` → `QuizBot()` → `QuizBot.run()`
 
 ## Directory Structure
 
 ```
 project-root/
-├── bot.py                  — вся логіка бота: онбординг, тести, адмінка, IPC через Telegram callbacks
+├── bot.py                  — Entire bot logic (admin/student flows, DOCX parsing, matching render + grading)
 ├── services/
-│   └── stats_service.py   — обчислення аналітики/ренкінгів для адмінського UI
+│   └── stats_service.py    — Analytics + admin UI helpers
 ├── data/
-│   ├── questions.json     — банк питань
-│   ├── students.json      — записи студентів + статуси + chat_id
-│   ├── admins.json         — admin user_id
-│   ├── topics.json         — теми (active/inactive, порядок)
-│   ├── state.json          — глобальні налаштування (тривалість, reminders, tombstones)
-│   ├── sessions.db (але фактично sessions.db — в корені)
-│   └── ... (інше)
-├── results.db             — SQLite: тестові результати + question stats
-├── sessions.db            — SQLite: persisted student dialog/test state
-├── README.md
-└── token.txt              — Telegram token (як альтернатива env var)
+│   ├── questions.json     — Question bank (includes `matching` questions)
+│   ├── topics.json         — Active topic list
+│   ├── students.json       — Student profile + approval status
+│   ├── state.json          — Bot global settings (duration + reminder config)
+│   └── ...docx_images/... — Extracted images cached during DOCX import
+└── results.db / sessions.db — Test history + per-user session state
 ```
 
 ## Key Abstractions
 
-### `QuizBot`
-
-- **File**: `bot.py` (клас починається на ~рядках 150+)
-- **Responsibility**: головний оркестратор. Тримайте тут invariants flow-логіки: створення student-record, онбординг, старт тесту лише після approval, адмінка.
-- **Ключові “вузли”**:
-    - Онбординг: `_handle_start()`, `_handle_text()` (гілка `student.awaiting_name`)
-    - Approval: `_handle_callback()` → `student:approve:{id}` або текстова команда `/approve`
-    - Старт тесту: `_start_test()` (guard: `student.status == "approved"`)
-- **Lifecycle**: створюється один раз у `main()`, живе весь час polling-loop.
-
-### `StudentState` (датаклас)
+### `Question` (dataclass)
 
 - **File**: `bot.py`
-- **Responsibility**: структура стану конкретного user’а (student/admin) в контексті бота.
-- **Важливі поля для Flow approval**:
-    - `status`: `"new" | "awaiting_name" | "pending_approval" | "approved" | "blocked" | "deleted"`
-    - `awaiting_name`: чи очікуємо прізвище/ім’я
-    - `first_name`, `last_name`, `full_name`
-    - `chat_id`: щоб адмін міг писати, а reminders могли розсилати
-- **Lifecycle**: завантажується з `students.json` + `sessions.db` через `_load_data()` і `_get_student()`.
+- **Responsibility:** Canonical in-memory representation of one quiz question.
+- **Interface (fields):**
+    - `type`: `"single" | "multi" | "matching" | "text"`
+    - `question`: prompt text
+    - `options`: list of option strings
+    - `answer`: list of integers
+        - for `matching`, `answer` is interpreted as a list where `answer[left_index] = right_index`
+    - `explanation`: explanation string
+    - `image`: optional dict with `{path, position, caption}`
+- **Lifecycle:** Created during DOCX import parsing; loaded from `data/questions.json`; used during student test generation and grading.
 
-### `JsonStore`
-
-- **File**: `bot.py`
-- **Responsibility**: простий JSON read/write з дефолтами.
-
-### `SessionStore`
+### `StudentState` (dataclass)
 
 - **File**: `bot.py`
-- **Responsibility**: SQLite persisted dialog/test state `student_sessions`. Використовується для переживання рестарту.
-- **Для approval-flow:** тут зберігаються “awaiting\_\*” прапорці, але ключове онбординг-поведінка — теж прив’язана до `StudentState.status/awaiting_name`.
+- **Responsibility:** Per-user runtime state persisted in `sessions.db`.
+- **Matching-specific fields:**
+    - `matching_pairs: Dict[int,int]` — maps chosen left index → chosen right index (both 0-based)
+    - `matching_selected_left: Optional[int]` — currently selected left index awaiting right selection
+    - `shuffled_matching_left: List[int]` — left-column shuffle permutation indices
+    - `shuffled_matching_right: List[int]` — right-column shuffle permutation indices
+- **Lifecycle:** Initialized/reset when a matching question is shown and cleared after grading.
 
-### `ResultsStore`
+### `ResultsStore` (SQLite wrapper)
 
 - **File**: `bot.py`
-- **Responsibility**: SQLite `test_results`, а також `question_stats` і `canonical_question_stats`.
-- **Для approval-flow:** approval не пише в results.db; guard старту тесту дивиться тільки на `student.status`.
+- **Responsibility:** Store test result history and per-question difficulty stats.
+- **Matching interaction:**
+    - `record_question_attempt(...canonical_key=...)` is called from `_grade_matching_question()`.
+    - Canonical key for matching includes normalized `options` and the `answer` list (without sorting for matching).
 
-### `BotApi`
+### `QuizBot` (main controller)
 
 - **File**: `bot.py`
-- **Responsibility**: низькорівневі запити до Telegram (getUpdates/sendMessage/editMessageText/answerCallbackQuery).
+- **Responsibility:** Entire bot orchestration: parsing DOCX, rendering questions, handling callbacks, grading, persistence.
+- **Key matching methods:**
+    - DOCX parsing: `_extract_docx_text_with_images()`, `_parse_docx_questions()`
+    - Render: `_send_current_question()` and `_build_keyboard()` and `_render_compact_options_text()`
+    - Parsing free-text answers: `_parse_matching_answer()`
+    - Grading: `_grade_matching_question()`
 
-### `StatsService`
+### DOCX parsing helpers inside `_parse_docx_questions()`
 
-- **File**: `services/stats_service.py`
-- **Responsibility**: формування аналітики/ренкінгу для admin UI (картка учня, кнопкиランキング).
-- **Для approval-flow:** не “затверджує” студентів; але адмінські списки/картки використовують `student.status`.
+- **File**: `bot.py` (nested functions within `_parse_docx_questions`)
+- **Responsibility:** Convert extracted DOCX plain text lines into `Question` blocks.
+- **Matching answer parser:** `parse_matching_answer(answer_text: str) -> List[int]`
+    - Intended mapping: left-side index (0-based) → right-side index (0-based)
+    - Current implementation assumes left side is **numeric** (e.g. `1-2`), not letters (e.g. `А-2`).
 
-## Data Flow (Flow “new student → approval”)
+## Data Flow (Concrete `matching` path)
 
-### 0) Передумови
+### 1) Admin imports DOCX → internal `Question` objects
 
-- Адмін задається через `data/admins.json` (які Telegram `user_id` дозволені).
-- Студент має розпочати з чату та зробити `/start`.
+1. Admin chooses topic via inline menu (`student.awaiting_docx_import` + `awaiting_docx_topic_id`).
+2. Admin sends a DOCX file → `_handle_document()`
+3. Bot downloads the DOCX and calls:
+    - `_extract_docx_text_with_images(path)`
+        - Reads `word/document.xml` from the DOCX zip.
+        - Builds `extracted_text` line-by-line from `w:p` paragraphs (`w:t` runs).
+        - Inserts image markers like `[[IMG<n>]]` (not directly involved in matching logic unless image is present).
+    - `_parse_docx_questions(extracted_text, topic_id=...)`
+        - Normalizes lines (removes soft hyphen, normalizes dash characters, collapses whitespace).
+        - Detects question start using `q_pat`:
+            - `Завдання|Питання|№ ...`
+        - Detects question type line using `x_pat`:
+            - `Тип: matching` → sets `current["type"]="matching"`
+        - Parses options with `o_pat`:
+            - Recognizes bullet/letter/number prefixes and captures the rest as option text.
+            - **When `current.type == "matching"`**, it further strips a leading left/right marker prefix from option lines:
+                - removes patterns like `A)`, `A.` and also numeric prefixes like `1)`.
+        - Parses answer line with `a_pat`:
+            - If type is matching → calls `parse_matching_answer(answer_text)`.
 
-### 1) Перший клік студента: `/start` → створення запису + перехід у `awaiting_name`
+4. After collecting `question`, `options`, and `answer`, `_parse_docx_questions()` calls `flush()`:
+    - Creates `Question(id=uuid, topic_id=..., type=..., question=..., options=..., answer=..., explanation=...)`
+5. Saved into `data/questions.json` by `_save_imported_questions()`.
 
-**Вхід:** `process_update()` отримує `message` з текстом `/start` → `_handle_start(message)`
+### 2) Students render matching question in Telegram
 
-**Дії:**
+1. When test starts or advances, `_send_current_question(student)` runs.
+2. For `question.type == "matching"`:
+    - Split by position, not by explicit left/right labels:
+        - `half = len(question.options)//2`
+        - `left_options = question.options[:half]`
+        - `right_options = question.options[half:]`
+    - Shuffle each side independently:
+        - `student.shuffled_matching_left = random.sample(range(len(left_options)), len(left_options))`
+        - `student.shuffled_matching_right = random.sample(range(len(right_options)), len(right_options))`
+    - Render UI:
+        - Human-readable instruction text:
+            - “Натискай спочатку лівий номер, потім праву букву.”
+        - Inline keyboard built by `_build_keyboard(..., question_type="matching")`:
+            - For each row index:
+                - left button callback: `answer:left:{index}` where index is 0-based in the **current left array**
+                - right button callback: `answer:right:{index}` where index is 0-based in the **current right array**
+            - Bottom buttons:
+                - `answer:submit` (“Підтвердити вибір”)
+                - `answer:reset` (“Скинути”)
 
-1. `_handle_start()` бере `user_id`, `chat_id` і викликає `_get_student(user_id, chat_id)`:
-    - якщо запису ще нема — створює `StudentState(user_id, chat_id)` і одразу `_persist_students()` (тобто з’являється `students.json`).
-2. `/start` також “обнуляє” admin-воркфлоу прапорці для `docx/import/topic action/delete action` (щоб не залишались “stale state”).
-3. Якщо `student.status` в `{ "new", "awaiting_name" }`:
-    - скидає `first_name/last_name/full_name`
-    - встановлює:
-        - `student.awaiting_name = True`
-        - `student.status = "awaiting_name"`
-    - пише студенту: **“Введи прізвище.”**
+3. Student state is reset before rendering:
+    - `student.matching_pairs = {}`
+    - `student.matching_selected_left = None`
 
-**Інваріант:** на цьому етапі бот гарантує, що наступне текстове повідомлення буде інтерпретовано як частина онбордингу, а не як тест-відповідь.
+### 3) Student selects pairs → callback state machine
 
-### 2) Крок 1 онбордингу: студент надсилає прізвище
+1. Student clicks a **left** button (`answer:left:{index}`):
+    - `_handle_callback()` sets:
+        - `student.matching_selected_left = index` (0-based)
+2. Student clicks a **right** button (`answer:right:{index}`):
+    - `_handle_callback()` verifies:
+        - a left is selected
+        - the chosen right index isn’t already used by another left selection
+    - Then stores:
+        - `student.matching_pairs[left_index] = right_index`
+    - Also clears `matching_selected_left = None`.
+3. Keyboard is re-rendered with “✅” markers:
+    - left “✅” if already matched
+    - right “✅” if already used (taken from `matching_pairs.values()`)
 
-**Вхід:** `process_update()` → `_handle_text(message)`  
-Умова: `if student.awaiting_name: ...`
+### 4) Submit → parse pairs → grade
 
-**Дії:**
+1. Student clicks `answer:submit`.
+2. `_handle_callback()` creates final pairs list:
+    - `pairs = [(left+1, right+1) for left, right in sorted(student.matching_pairs.items())]`
+3. Calls `_grade_matching_question(student, pairs)`:
+    - `expected_pairs = {(index+1, value+1) for index, value in enumerate(question.answer)}`
+    - `provided_pairs = {(left, right) for left, right in pairs if left > 0 and right > 0}`
+    - Correct if `provided_pairs == expected_pairs` (exact pair set equality).
 
-- якщо `student.last_name` ще порожній:
-    - бот нормалізує текст (залишає слова, робить `capitalize()`)
-    - зберігає в `student.last_name`
-    - робить `_persist_students()`
-    - просить: **“Введи ім'я.”**
+### 5) Free-text matching parsing (fallback)
 
-**Стан після кроку:** `status` лишається `awaiting_name`, але `last_name` вже заповнений.
-
-### 3) Крок 2 онбордингу: студент надсилає ім’я → заявка на approval
-
-**Вхід:** знову `_handle_text()` у гілці `student.awaiting_name`
-
-**Дії:**
-
-- якщо `student.last_name` вже заповнений:
-    1. зберігає `student.first_name`
-    2. формує `student.full_name = "{last_name} {first_name}"`
-    3. вимикає `student.awaiting_name = False`
-    4. далі розвилка:
-
-#### 3a) Якщо користувач є адміном (`user_id ∈ admin_user_ids`)
-
-- `student.status = "approved"`
-- бот пише:
-    - **“Дані отримано. Ти маєш адмін-доступ.”** (або схоже повідомлення)
-
-> Окремий “прихований” механізм: навіть після рестарту `_load_data()` може перевести admin-акаунти в `approved`, якщо їх статус був `"new/awaiting_name/pending_approval"`.
-
-#### 3b) Інакше (звичайний студент)
-
-- `student.status = "pending_approval"`
-- бот пише:
-    - **“Запит прийнято. Адміністрація розгляне…”**
-- запускає `_notify_admins()` з повідомленням про нову заявку і inline-кнопками:
-    - `✅ Схвалити` → callback `student:approve:{user_id}`
-    - `🚫 Відхилити` → callback `student:block:{user_id}`
-- робить `_persist_students()`.
-
-**Стан після кроку:** `pending_approval`, доступ до тестів ще закритий.
-
-### 4) Розгляд заявки адміном: approval callback → `approved`
-
-**Вхід:** адмін натискає кнопку → `process_update()` отримує `callback_query` → `_handle_callback(callback_query)`
-
-**Гілка:** `if data.startswith("student:approve:")`:
-
-**Дії:**
-
-1. Перевірка прав:
-    - `if user["id"] not in self.admin_user_ids: ... return`
-2. `target_student = self.students.get(target_id)`
-3. Встановлення:
-    - `target_student.status = "approved"`
-    - `_persist_students()`
-4. Бот показує адміну картку учня через `_show_student_details()`:
-    - якщо статус `approved`, адмін бачить кнопку **“🚫 Заблокувати”** (ікони/кнопки відрізняються)
-5. Далі розсилка:
-    - повідомлення самому студенту (якщо `target_student.chat_id` відомий):
-        - **“Твої дані схвалено.Доступ відкрито.”**
-    - `_notify_admins()` ще раз повідомляє всім адмінам:
-        - **“✅ Учня схвалено: … (ID …)”**
-6. `answerCallbackQuery()`.
-
-**Стан після approval:** `status = "approved"`.
-
-### 5) Поведінка після approval: студент може запускати тести
-
-**Важливо:** доступ контролюється не лише UI, а жорстко в `_start_test()`:
-
-- `_start_test()` містить guard:
-    - якщо `student.status != "approved"`:
-        - скидає поточний тест
-        - `_persist_students()`
-        - пише студенту **“Доступ заборонено”**
-        - return
-
-Тому адмінське схвалення робить студента реально доступним для тестів.
+- If a student types a message while `student.current_question_id` is matching, `_handle_text()` calls:
+    - `_parse_matching_answer(text)` → list of `(left, right)` tuples
+- However, in the normal UI flow, students are expected to use buttons; free-text format is more brittle than the callback flow.
 
 ## Non-Obvious Behaviors & Design Decisions
 
-### 1) Статуси онбордингу чітко “прив’язані” до текстових повідомлень
+### A) DOCX matching answer parsing assumes a numeric left side
 
-Як тільки `student.awaiting_name=True`, будь-який `text` від користувача інтерпретується як частина онбордингу (прізвище/ім’я), а не як команда/відповідь на тест.
+- In `_parse_docx_questions()`, the nested `parse_matching_answer()`:
+    - Uses regex `re.findall(r"(\d+)\s*[-=:]?\s*([a-zа-яіїєґ]|\d+)", normalized)`
+    - This **only matches when the left part starts with digits** (e.g. `1-2`, `2:4`, `3=А`, etc.).
+- But your provided DOCX examples use **letter-left** on the left column:
+    - `Відповідь: А-2, Б-4, В-1, Г-3`
+- With the current regex, the left-side letters (`А`, `Б`, `В`, `Г`) will not match `(\d+)`, so `parse_matching_answer()` will likely return `[]`.
+- **Meaning:** imported `matching` questions can end up with an empty or wrong `question.answer`, which makes grading incorrect even if the options were imported correctly.
 
-### 2) Адмінські акаунти автоматично можуть отримати доступ
+### B) Matching uses `half = len(options)//2` to split left vs right
 
-- На етапі введення імені: якщо `user_id` належить `admin_user_ids` → `approved`.
-- Після рестарту: `_load_data()` також може принудово перевести адміна в `approved`, якщо він у “ранніх” статусах.
+- Both render and grading rely on the positional split:
+    - left = first half of `question.options`
+    - right = second half
+- There is no explicit parsing of “Лівий стовпець / Правий стовпець” into two separate arrays.
+- **Meaning:** if DOCX parsing accidentally includes headings, extra whitespace lines, or mis-detects option lines, left/right ordering breaks and the shuffle + grading mapping becomes wrong.
 
-Це важливо, щоб адмін міг робити DOCX import і керування тестами навіть без окремого “approval-кліку”.
+### C) Student callback indices are 0-based, grading converts to 1-based for comparison
 
-### 3) “deleted” не видаляється з історії доступу повністю
+- Callback stores `matching_pairs[left_index] = right_index` (0-based).
+- Submit converts to `(left+1, right+1)`.
+- Expected pairs are also built as `(index+1, answer_value+1)`.
+- **Meaning:** This consistency is deliberate; any future change to callback numbering must preserve the `+1` contract in grading.
 
-Є tombstone-механіка:
+### D) Right-column “letters” in the UI are always Latin (`a`, `b`, ...)
 
-- `deleted_student_keys` зберігається в `state.json`
-- `_get_student()` може повертати `StudentState(status="deleted")` для не-адмінів, щоби не відновити їх після видалення.
-- Для адмінів tombstone чиститься (вони можуть лишатися повністю “робочими” для імпорту/редагування).
+- `_build_keyboard()` for matching right buttons displays:
+    - `chr(ord('a') + index)`
+- `_grade_matching_question()` uses `alphabet = "abcdefghijklmnopqrstuvwxyz"` for displaying correct/provided pair text.
+- **Meaning:** if you ever need to display Cyrillic letters (А/Б/В…), the UI currently won’t do it; it only uses Latin letters for the right side.
 
-Це не стосується approval напряму, але впливає на те, як повторно з’являється “новий” запис при /start.
+### E) Compact mode modifies text but not the underlying callback mapping
 
-### 4) У коді є дубль кнопки “Схвалити” в картці
+- `compact_mode` changes how options are printed and what the student sees (and sometimes which “preview” text is used),
+- but callback data remains `answer:left:{index}` and `answer:right:{index}`.
+- **Meaning:** compact mode is safe for grading, but it can confuse developers if they look only at message text instead of internal indices.
 
-У `_show_student_details()` для не-approved гілки додається `keyboard["inline_keyboard"].append(... "student:approve:...")` двічі. Це не ламає approval-flow, але є UX/cleanliness issue.
+## Module Reference (important files/functions)
 
-## Module Reference
+| File                        | Purpose                                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `bot.py`                    | Entire system: DOCX extraction + parsing, Telegram UI rendering, callback handling, matching grading              |
+| `services/stats_service.py` | Admin/statistics helpers (not directly involved in matching parsing/grading)                                      |
+| `data/questions.json`       | Persisted question bank; `matching` questions appear here as `type:"matching"` with `options` and `answer` arrays |
 
-| File                        | Purpose                                                                                                             |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `bot.py`                    | Головна реалізація бота: онбординг (/start + два повідомлення), збереження стану, тести, адмін-меню, approval/block |
-| `services/stats_service.py` | Аналітика студента та побудова адмінських кнопок рейтингу/картки                                                    |
+## Suggested Reading Order (for a new engineer)
 
-## Suggested Reading Order
+1. `QuizBot._parse_docx_questions()` (matching-specific nested helpers: `parse_matching_answer`, option parsing rules)
+2. `QuizBot._send_current_question()` (matching render: split/shuffle/instruction)
+3. `QuizBot._build_keyboard()` (matching inline keyboard layout + callback_data contract)
+4. `QuizBot._handle_callback()` (left→right selection state machine + submit/reset)
+5. `QuizBot._grade_matching_question()` (expected vs provided pair equality logic)
 
-1. `bot.py` — класи `StudentState`, `JsonStore`, `SessionStore`, `ResultsStore` (щоб розуміти state/зберігання)
-2. `bot.py` — `_handle_start()` (початок онбордингу)
-3. `bot.py` — `_handle_text()` гілка `if student.awaiting_name:` (де з’являється `pending_approval` і викликається `_notify_admins`)
-4. `bot.py` — `_handle_callback()` гілка `student:approve:` (де status стає `approved`)
-5. `bot.py` — `_start_test()` guard `student.status != "approved"` (де реально закривається доступ до тестів)
-6. `services/stats_service.py` — якщо цікавить адмінський UI після approval
+## What’s most likely “the nuance to fix” (based on your DOCX samples)
 
-## TODO checklist (для перевірки/документування вашого Flow)
+Your DOCX answers format uses **letters on the left** (`А-2, Б-4, ...`) and **numbers on the right**.  
+But the current DOCX matching answer parser only recognizes **numbers on the left**. That mismatch is non-obvious because:
 
-- [x] Знайти точки входу: `/start`, обробка тексту, callback
-- [x] Відстежити переходи статусів: `new → awaiting_name → pending_approval → approved`
-- [x] Описати повідомлення/запити, які відправляються адміну
-- [x] Описати approval механізм: inline callback і side-effects (notify + картка)
-- [x] Показати guard, який блокує старт тесту до approval
-- [ ] (Опціонально) Перевірити UI/UX: дубль “Схвалити” та повідомлення з кирилицею/кодуванням (якщо потрібно уточнення)
+- options parsing strips left markers and collects option texts,
+- but answer parsing uses a different regex contract than the DOCX template.
+
+So the likely fix is to extend `parse_matching_answer()` so it can parse patterns where the **left side is a letter (Latin or Cyrillic)** and the **right side is a number**, and then map both sides into 0-based indices consistent with `expected_pairs` in `_grade_matching_question()`.

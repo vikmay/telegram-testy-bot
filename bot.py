@@ -56,6 +56,7 @@ class Question:
     options: List[str]
     answer: List[int]
     explanation: str
+    image: Optional[dict] = None
 
 
 @dataclass
@@ -662,6 +663,79 @@ class BotApi:
             payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         return self.request("editMessageText", payload)
 
+    def send_photo(
+        self,
+        chat_id: int,
+        photo_path: str,
+        caption: Optional[str] = None,
+        reply_markup: Optional[dict] = None,
+    ):
+        """
+        Telegram sendPhoto via multipart/form-data (no dependency on requests).
+
+        Contracts:
+        - photo_path must exist on disk
+        - caption/reply_markup are optional
+        """
+        path = Path(photo_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Photo not found: {photo_path}")
+
+        ext = path.suffix.lower().lstrip(".")
+        mime = "application/octet-stream"
+        if ext == "png":
+            mime = "image/png"
+        elif ext in {"jpg", "jpeg"}:
+            mime = "image/jpeg"
+        elif ext == "gif":
+            mime = "image/gif"
+        elif ext == "webp":
+            mime = "image/webp"
+
+        filename = path.name
+        photo_bytes = path.read_bytes()
+
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+        url = f"{self.base_url}/sendPhoto"
+
+        def part_text(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+
+        body = bytearray()
+        body += part_text("chat_id", str(chat_id))
+
+        body += (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+        body += photo_bytes
+        body += b"\r\n"
+
+        if caption is not None:
+            body += part_text("caption", str(caption))
+
+        if reply_markup is not None:
+            body += part_text("reply_markup", json.dumps(reply_markup, ensure_ascii=False))
+
+        body += f"--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok"):
+                raise RuntimeError(f"Telegram API error: {result}")
+            return result["result"]
+
 
 class QuizBot:
     def __init__(self):
@@ -1089,7 +1163,124 @@ class QuizBot:
                 paragraphs.append("".join(texts).strip())
         return "\n".join(line for line in paragraphs if line)
 
-    def _parse_docx_questions(self, text: str, topic_id: str) -> List[Question]:
+    def _extract_docx_text_with_images(self, path: Path) -> Tuple[str, Dict[int, dict]]:
+        """
+        Extracts:
+        - human-readable paragraph text from word/document.xml (w:t)
+        - inline images referenced by w:drawing/a:blip r:embed
+
+        Saves images to:
+          data/docx_images/<docx_sha256>/img_<n>.<ext>
+
+        Returns:
+        - extracted text where each image is represented as token [[IMG<n>]]
+        - images_by_marker mapping n -> {"path": ..., "position": "top", "caption": ...}
+        """
+        docx_sha = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        images_dir = DATA_DIR / "docx_images" / docx_sha
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        images_by_marker: Dict[int, dict] = {}
+        rid_to_marker: Dict[str, int] = {}
+
+        with zipfile.ZipFile(path) as archive:
+            document_xml = archive.read("word/document.xml")
+
+            rels_path = "word/_rels/document.xml.rels"
+            rels_map: Dict[str, str] = {}
+            if rels_path in archive.namelist():
+                rels_xml = archive.read(rels_path)
+                rel_root = ET.fromstring(rels_xml)
+                for rel in rel_root.findall(".//{*}Relationship"):
+                    rid = rel.get("Id")
+                    target = rel.get("Target")
+                    if not rid or not target:
+                        continue
+                    rels_map[rid] = target
+
+            root = ET.fromstring(document_xml)
+            ns = {
+                "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }
+
+            marker_replacements = []
+            paragraphs: List[str] = []
+            marker_count = 0
+
+            # Each w:p becomes one line in our extracted text.
+            for paragraph in root.findall(".//w:p", ns):
+                text_nodes = [
+                    node.text
+                    for node in paragraph.findall(".//w:t", ns)
+                    if node is not None and node.text
+                ]
+                paragraph_text = "".join(text_nodes).strip()
+
+                # Find all embedded images in this paragraph.
+                blips = paragraph.findall(".//a:blip", ns)
+                markers_in_paragraph: List[str] = []
+
+                for blip in blips:
+                    # Check both r:embed and r:id for broader compatibility
+                    embed_rid = blip.get(f"{{{ns['r']}}}embed") or blip.get(f"{{{ns['r']}}}id")
+                    if not embed_rid:
+                        continue
+
+                    if embed_rid not in rid_to_marker:
+                        target = rels_map.get(embed_rid)
+                        if not target:
+                            continue
+
+                        # target usually like "media/image1.png"
+                        target_name = target.split("/")[-1]
+                        ext = Path(target_name).suffix.lower() or ".png"
+                        if ext and ext != "":
+                            pass
+                        else:
+                            ext = ".png"
+
+                        marker_id = marker_count
+                        marker_count += 1
+                        rid_to_marker[embed_rid] = marker_id
+
+                        media_path = f"word/{target}"
+                        if media_path in archive.namelist():
+                            img_bytes = archive.read(media_path)
+                        else:
+                            # Fallback: try "word/" + last two segments
+                            media_path = f"word/{target_name}"
+                            img_bytes = archive.read(media_path)
+
+                        saved_path = images_dir / f"img_{marker_id}{ext}"
+                        saved_path.write_bytes(img_bytes)
+
+                        images_by_marker[marker_id] = {
+                            # Store path relative to DATA_DIR for portability
+                            "path": str(saved_path.relative_to(DATA_DIR)),
+                            "position": "top",
+                            "caption": None,
+                        }
+
+                    markers_in_paragraph.append(f"[[IMG{rid_to_marker[embed_rid]}]]")
+
+                if paragraph_text and markers_in_paragraph:
+                    paragraphs.append(f"{paragraph_text} {' '.join(markers_in_paragraph)}".strip())
+                elif markers_in_paragraph:
+                    paragraphs.append(" ".join(markers_in_paragraph).strip())
+                elif paragraph_text:
+                    paragraphs.append(paragraph_text)
+
+        extracted_text = "\n".join(line for line in paragraphs if line)
+        return extracted_text, images_by_marker
+
+    def _parse_docx_questions(
+        self,
+        text: str,
+        topic_id: str,
+        images_by_marker: Optional[Dict[int, dict]] = None,
+    ) -> List[Question]:
         def normalize(line: str) -> str:
             cleaned = (
                 line.replace("\u00ad", "")
@@ -1148,8 +1339,26 @@ class QuizBot:
                 return "text"
             return cleaned or "single"
 
+        # Buffer for images that appear BEFORE any question (current is None).
+        pending_images: List[dict] = []
+
+        def attach_pending_images(target: Dict[str, object]):
+            """Attach buffered pending images to a newly created question dict."""
+            nonlocal pending_images
+            if not pending_images:
+                return
+            # Pick the best image (prefer "top" position).
+            best_img = pending_images[0]
+            for img in pending_images[1:]:
+                if str(img.get("position", "")).strip().lower() == "top":
+                    best_img = img
+                    break
+            target["image"] = best_img
+            pending_images = []
+
         def flush():
             nonlocal current
+            nonlocal pending_images
             if not current:
                 return
             question_text = str(current.get("question", "")).strip()
@@ -1167,11 +1376,42 @@ class QuizBot:
                         options=options,
                         answer=answer,
                         explanation=str(current.get("explanation", "")),
+                        image=current.get("image"),  # preserve any already-attached image
                     )
                 )
             current = None
 
         for line in lines:
+            # 1. Parse and extract images from the line first
+            line_images = []
+            if images_by_marker and "[[IMG" in line:
+                marker_ids = [int(x) for x in re.findall(r"\[\[IMG(\d+)\]\]", line)]
+                
+                try:
+                    with open(DATA_DIR / "debug_import.log", "a", encoding="utf-8") as f:
+                        f.write(f"\n--- LOOKUP DEBUG ---\n")
+                        f.write(f"Original line: {line}\n")
+                        f.write(f"Extracted marker_ids: {marker_ids}\n")
+                        f.write(f"images_by_marker keys: {[(type(k), k) for k in images_by_marker.keys()]}\n")
+                except Exception:
+                    pass
+
+                line = re.sub(r"\[\[IMG\d+\]\]", "", line).strip()
+
+                for marker_id in marker_ids:
+                    # Support lookup by both int and string key for safety
+                    new_img = images_by_marker.get(marker_id) or images_by_marker.get(str(marker_id))
+                    
+                    try:
+                        with open(DATA_DIR / "debug_import.log", "a", encoding="utf-8") as f:
+                            f.write(f"Looking up {marker_id}: found={new_img is not None}\n")
+                    except Exception:
+                        pass
+                        
+                    if isinstance(new_img, dict):
+                        line_images.append(new_img)
+
+            # 2. Check for topic line
             if (m := t_pat.match(line)):
                 name = m.group(1).strip()
                 topic = self._find_topic_by_name(name)
@@ -1179,6 +1419,7 @@ class QuizBot:
                     active_topic_id = topic.id
                 continue
 
+            # 3. Check for new question match
             match = q_pat.match(line)
             if match:
                 flush()
@@ -1191,9 +1432,44 @@ class QuizBot:
                     "answer": [],
                     "explanation": "",
                 }
+                # Attach images found on this new question line
+                pending_images.extend(line_images)
+                attach_pending_images(current)
+                
+                if not line:
+                    continue
+                continue
+
+            # 4. If it's not a new question, attach line images to current active question or buffer them
+            if line_images:
+                is_current_done = False
+                if current is not None:
+                    if current.get("options") or current.get("answer") or current.get("explanation"):
+                        is_current_done = True
+
+                if current is not None and not is_current_done:
+                    for new_img in line_images:
+                        old_img = current.get("image")
+                        old_pos = (
+                            str(old_img.get("position", "")).strip().lower() if isinstance(old_img, dict) else ""
+                        )
+                        new_pos = str(new_img.get("position", "")).strip().lower()
+
+                        if old_pos != "top" and new_pos == "top":
+                            current["image"] = new_img
+                        elif not isinstance(old_img, dict) or old_pos != "top":
+                            current["image"] = new_img
+                else:
+                    pending_images.extend(line_images)
+
+            if not line:
                 continue
 
             if current is None:
+                continue
+
+            # Пропускаємо заголовки колонок у matching-питаннях
+            if re.match(r"^(Лівий стовпець|Права колонка|Ліва колонка|Відповідність)[\s:]*", line, re.IGNORECASE):
                 continue
 
             if (m := x_pat.match(line)):
@@ -1267,8 +1543,32 @@ class QuizBot:
     def _load_questions_from_docx(self) -> List[Question]:
         return []
 
-    def _load_questions_from_uploaded_docx(self, path: Path, fallback_topic_id: str = "") -> List[Question]:
-        return self._parse_docx_questions(self._extract_docx_text(path), topic_id=fallback_topic_id)
+    # This method extracts text and images from a DOCX and parses them into Question objects.
+    # It was previously missing or incorrectly defined, leading to AttributeError.
+    def _load_questions_from_uploaded_docx(self, path: Path, topic_id: str = "") -> List[Question]:
+        extracted_text, images_by_marker = self._extract_docx_text_with_images(path)
+        debug_log = DATA_DIR / "debug_import.log"
+        try:
+            with open(debug_log, "w", encoding="utf-8") as f:
+                f.write(f"=== SHA256 PREFIX ===\n{hashlib.sha256(path.read_bytes()).hexdigest()[:16]}\n\n")
+                f.write("=== IMAGES BY MARKER ===\n")
+                f.write(json.dumps(images_by_marker, indent=2, ensure_ascii=False) + "\n\n")
+                f.write("=== EXTRACTED TEXT ===\n")
+                f.write(extracted_text + "\n")
+        except Exception as e:
+            print(f"Failed to write debug log: {e}")
+        
+        parsed = self._parse_docx_questions(extracted_text, topic_id=topic_id, images_by_marker=images_by_marker)
+        
+        try:
+            with open(debug_log, "a", encoding="utf-8") as f:
+                f.write("\n=== PARSED QUESTIONS ===\n")
+                for q in parsed:
+                    f.write(f"ID: {q.id}, Q: {q.question[:40]}, Image: {q.image}\n")
+        except Exception as e:
+            print(f"Failed to append debug log: {e}")
+            
+        return parsed
 
     def _save_imported_questions(self, imported: List[Question]) -> Tuple[int, int]:
         existing_ids = {question.id for question in self.questions}
@@ -1277,22 +1577,23 @@ class QuizBot:
         for question in imported:
             unique_id = self._dedupe_question_id(question.id, existing_ids)
             if unique_id != question.id:
-                duplicates += 1
-                question = Question(
-                    id=unique_id,
-                    topic_id=question.topic_id,
-                    type=question.type,
-                    question=question.question,
-                    options=question.options,
-                    answer=question.answer,
-                    explanation=question.explanation,
-                )
+                    duplicates += 1
+                    question = Question(
+                        id=unique_id,
+                        topic_id=question.topic_id,
+                        type=question.type,
+                        question=question.question,
+                        options=question.options,
+                        answer=question.answer,
+                        explanation=question.explanation,
+                        image=question.image,
+                    )
             if not question.topic_id:
                 continue
             self.questions.append(question)
             existing_ids.add(question.id)
             added += 1
-        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
+        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation, "image": q.image} for q in self.questions])
         return added, duplicates
 
     def _download_telegram_file(self, file_id: str) -> Optional[Path]:
@@ -1343,10 +1644,11 @@ class QuizBot:
                             explanation=str(row.get("explanation", "")).strip(),
                         )
                     )
-            self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
         else:
             self.questions = self._load_questions_from_docx()
-            self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
+
+        # Normalize persisted payload to always include `image` (backward compatible: missing => None).
+        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation, "image": q.image} for q in self.questions])
 
         if self.topics and any(not topic.id for topic in self.topics):
             self.topics = [topic for topic in self.topics if topic.id]
@@ -1562,6 +1864,7 @@ class QuizBot:
         matching_selected_left: Optional[int] = None,
         matching_left_map: Optional[List[int]] = None,
         matching_right_map: Optional[List[int]] = None,
+        compact_mode: bool = False,
     ):
         keyboard = []
         selected_indexes = selected_indexes or set()
@@ -1582,11 +1885,17 @@ class QuizBot:
                 row = []
                 if index < len(left_options):
                     left_mark = "✅ " if index in matching_pairs else ("👉 " if matching_selected_left == index else "")
-                    left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 22)}"
+                    if compact_mode:
+                        left_label = f"{left_mark}{index + 1}".strip()
+                    else:
+                        left_label = f"{left_mark}{index + 1}. {trim_label(left_options[index], 40)}"
                     row.append({"text": left_label, "callback_data": f"answer:left:{index}"})
                 if index < len(right_options):
                     right_mark = "✅ " if index in matching_pairs.values() else ""
-                    right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 22)}"
+                    if compact_mode:
+                        right_label = f"{right_mark}{chr(ord('a') + index)}".strip()
+                    else:
+                        right_label = f"{right_mark}{chr(ord('a') + index)}. {trim_label(right_options[index], 40)}"
                     row.append({"text": right_label, "callback_data": f"answer:right:{index}"})
                 keyboard.append(row)
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
@@ -1594,16 +1903,71 @@ class QuizBot:
             return {"inline_keyboard": keyboard}
         if question_type == "multi":
             for index, option in enumerate(options, start=1):
-                label = f"{index}. {trim_label(option, 34)}"
-                if (index - 1) in selected_indexes:
-                    label = f"✅ {label}"
+                if compact_mode:
+                    label = f"{index}"
+                    if (index - 1) in selected_indexes:
+                        label = f"✅ {label}"
+                else:
+                    label = f"{index}. {trim_label(option, 34)}"
+                    if (index - 1) in selected_indexes:
+                        label = f"✅ {label}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
             keyboard.append([{"text": "▶️ Підтвердити вибір", "callback_data": "answer:submit"}])
         else:
             for index, option in enumerate(options, start=1):
-                label = f"{index}. {trim_label(option, 34)}"
+                if compact_mode:
+                    label = f"{index}"
+                else:
+                    label = f"{index}. {trim_label(option, 34)}"
                 keyboard.append([{"text": label, "callback_data": f"answer:{index-1}"}])
         return {"inline_keyboard": keyboard}
+
+    def _compact_mode_for_question(self, question: Question) -> bool:
+        if question.type == "text":
+            return False
+        threshold = 24
+        try:
+            return any(len(str(opt)) > threshold for opt in (question.options or []) if opt is not None)
+        except Exception:
+            return False
+
+    def _render_compact_options_text(
+        self,
+        question: Question,
+        matching_left_map: Optional[List[int]] = None,
+        matching_right_map: Optional[List[int]] = None,
+    ) -> str:
+        matching_left_pattern = r'^[\s\.\:\-\u2013\u2014]+\s*'
+        options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
+        if question.type == "matching":
+            half = len(question.options) // 2
+            left_source = question.options[:half] if half else question.options
+            right_source = question.options[half:] if half else []
+
+            if matching_left_map is not None:
+                left_options = [left_source[i] for i in matching_left_map if 0 <= i < len(left_source)]
+            else:
+                left_options = left_source
+
+            if matching_right_map is not None:
+                right_options = [right_source[i] for i in matching_right_map if 0 <= i < len(right_source)]
+            else:
+                right_options = right_source
+
+            left_lines = "\n".join(
+                    f"{i + 1}) {re.sub(matching_left_pattern, '', str(opt)).strip()}"
+                for i, opt in enumerate(left_options)
+            )
+            right_lines = "\n".join(
+                    f"{chr(ord('a') + i)}) {re.sub(options_pattern, '', str(opt)).strip()}"
+                for i, opt in enumerate(right_options)
+            )
+            return f"Ліва колонка:\n{left_lines}\n\nПрава колонка:\n{right_lines}"
+        lines = "\n".join(
+                    f"{i + 1}) {re.sub(options_pattern, '', str(opt)).strip()}"
+            for i, opt in enumerate(question.options or [])
+        )
+        return f"Варіанти:\n{lines}"
 
     def _get_topics(self) -> List[Topic]:
         return [topic for topic in self.topics if topic.active]
@@ -1680,11 +2044,38 @@ class QuizBot:
 
     def _delete_questions_by_filter(self, predicate) -> int:
         before = len(self.questions)
+        to_delete = [q for q in self.questions if predicate(q)]
         self.questions = [question for question in self.questions if not predicate(question)]
         deleted = before - len(self.questions)
         if deleted <= 0:
             return 0
-        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
+
+        # Clean up deleted question images
+        # Build set of image paths referenced by the remaining questions to avoid deleting shared images
+        remaining_image_paths = set()
+        for q in self.questions:
+            if isinstance(getattr(q, "image", None), dict):
+                path = q.image.get("path")
+                if path:
+                    remaining_image_paths.add(path)
+
+        for q in to_delete:
+            if isinstance(getattr(q, "image", None), dict):
+                path = q.image.get("path")
+                if path and path not in remaining_image_paths:
+                    full_path = DATA_DIR / path
+                    try:
+                        if full_path.exists():
+                            full_path.unlink()
+                            # If the parent directory (e.g. data/docx_images/sha) is empty, remove it too
+                            parent_dir = full_path.parent
+                            if parent_dir.exists() and parent_dir.name != "docx_images":
+                                if not any(parent_dir.iterdir()):
+                                    parent_dir.rmdir()
+                    except Exception as exc:
+                        print(f"Failed to delete image {full_path}: {exc}")
+
+        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation, "image": q.image} for q in self.questions])
         return deleted
 
     def _delete_topic_questions(self, topic_id: str) -> int:
@@ -1810,6 +2201,10 @@ class QuizBot:
         elif student.status == "pending_approval":
             keyboard["inline_keyboard"].append(
                 [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}]
+            )
+        elif student.status == "blocked":
+            keyboard["inline_keyboard"].append(
+                [{"text": "✅ Розблокувати", "callback_data": f"student:unblock:{student.user_id}"}]
             )
         keyboard["inline_keyboard"].append(
             [{"text": "✏️ Редагувати ім’я/прізвище", "callback_data": f"admin:edit_student_name:{student.user_id}"}]
@@ -2132,7 +2527,7 @@ class QuizBot:
                     reply_markup={
                         "inline_keyboard": [
                             [{"text": "✅ Схвалити", "callback_data": f"student:approve:{student.user_id}"}],
-                            [{"text": "🚫 Відхилити", "callback_data": f"student:block:{student.user_id}"}],
+                            [{"text": "🚫 Відхилити", "callback_data": f"student:reject:{student.user_id}"}],
                         ]
                     },
                 )
@@ -2162,7 +2557,9 @@ class QuizBot:
         if user["id"] not in self.admin_user_ids:
             self.api.send_message(chat["id"], "Документ можуть імпортувати лише адміністратори.")
             return
-        if not student.awaiting_docx_import:
+        # Defensive import gating:
+        # DOCX import must happen ONLY when admin explicitly entered import mode AND selected a topic.
+        if not student.awaiting_docx_import or not student.awaiting_docx_topic_id:
             self.api.send_message(chat["id"], "Спочатку обери тему для імпорту DOCX.")
             return
         file_name = document.get("file_name", "")
@@ -2206,9 +2603,6 @@ class QuizBot:
                 ]
             },
         )
-
-    def _load_questions_from_uploaded_docx(self, path: Path, topic_id: str = "") -> List[Question]:
-        return self._parse_docx_questions(self._extract_docx_text(path), topic_id=topic_id)
 
     def _send_admin_help(self, chat_id: int):
         lines = [
@@ -2546,11 +2940,41 @@ class QuizBot:
         if self._time_is_up(student):
             self._finish_test_due_to_timeout(student)
             return
+        # Optional photo rendering (DOCX-imported “question-level” image)
+        # NOTE: for now "below" is sent as a separate message AFTER the main question message
+        # because Telegram text+inline keyboards are in a single message.
+        image_meta = question.image if isinstance(getattr(question, "image", None), dict) else None
+        photo_position = "top"
+        photo_path = None
+        photo_caption = None
+        if image_meta:
+            photo_position = str(image_meta.get("position", "top")).strip().lower() or "top"
+            raw_path = image_meta.get("path")
+            photo_caption = image_meta.get("caption")
+            if raw_path:
+                # Resolve path relative to DATA_DIR
+                photo_path = DATA_DIR / raw_path
+                if not photo_path.exists():
+                    photo_path = None
+
+        if photo_position == "top" and photo_path:
+            try:
+                self.api.send_photo(student.chat_id, str(photo_path), caption=photo_caption)
+            except Exception:
+                # Don’t crash the quiz on missing/bad image files
+                pass
+
         text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+        timer_line = ""
         if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
             elapsed = int(time.time() - float(student.current_test_started_at))
             remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
-            text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+            timer_line = f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+            if question.type != "matching":
+                text += timer_line
+
+        compact_mode = self._compact_mode_for_question(question)
+
         if question.type == "matching":
             half = len(question.options) // 2
             left_options = question.options[:half] if half else question.options
@@ -2560,39 +2984,91 @@ class QuizBot:
             shuffled_left_options = [left_options[index] for index in student.shuffled_matching_left] if left_options else []
             shuffled_right_options = [right_options[index] for index in student.shuffled_matching_right] if right_options else []
             block_lines = ["Ліва колонка:"]
-            block_lines.extend([f"{i + 1}. {opt}" for i, opt in enumerate(shuffled_left_options)])
+            block_lines.extend([f"{i + 1}) {opt}" for i, opt in enumerate(shuffled_left_options)])
             block_lines.append("")
             block_lines.append("Права колонка:")
-            block_lines.extend([f"{chr(ord('a') + i)}. {opt}" for i, opt in enumerate(shuffled_right_options)])
-            text += "\n\nЗістав пари: натискай спочатку лівий номер, потім праву букву. Пару можна змінювати до підтвердження.\n\n" + "\n".join(block_lines)
+            block_lines.extend([f"{chr(ord('a') + i)}) {opt}" for i, opt in enumerate(shuffled_right_options)])
+            if compact_mode:
+                text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\n" + "\n".join(block_lines) + "\n\nПари: нічого"
+            else:
+                text += "\nНатискай спочатку лівий номер, потім праву букву." + timer_line + "\n\nПари: нічого"
             student.matching_pairs = {}
             student.matching_selected_left = None
             sent_message = self.api.send_message(
                 student.chat_id,
                 text,
-                reply_markup=self._build_keyboard(
-                    shuffled_left_options + shuffled_right_options,
-                    question_type="matching",
-                    matching_pairs=student.matching_pairs,
-                    matching_selected_left=student.matching_selected_left,
-                ),
+                        reply_markup=self._build_keyboard(
+                            shuffled_left_options + shuffled_right_options,
+                            question_type="matching",
+                            matching_pairs={},
+                            matching_selected_left=None,
+                            compact_mode=compact_mode,
+                        ),
             )
             if isinstance(sent_message, dict) and "message_id" in sent_message:
                 student.current_question_message_id = sent_message["message_id"]
                 self._persist_students()
+
+            if photo_position != "top" and photo_path:
+                try:
+                    self.api.send_photo(student.chat_id, str(photo_path), caption=photo_caption)
+                except Exception:
+                    pass
             return
+
         if question.type == "multi":
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
-            text += "\n\nВибрано: нічого"
-            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
+            if compact_mode:
+                compact_multi_pattern = r'^[\s\.\:\-•\u2013\u2014]+\s*'
+                opts_lines = "\n".join(
+                    f"{i + 1}) {re.sub(compact_multi_pattern, '', str(opt)).strip()}"
+                    for i, opt in enumerate(shuffled_options)
+                )
+                text += f"\n\nВаріанти:\n{opts_lines}"
+            if question.type == "matching":
+                text += "\n\nВибрано: нічого"
+            sent_message = self.api.send_message(
+                student.chat_id,
+                text,
+                reply_markup=self._build_keyboard(
+                    shuffled_options,
+                    question_type=question.type,
+                    selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options},
+                    compact_mode=compact_mode,
+                ),
+            )
         else:
             student.shuffled_options = random.sample(list(range(len(question.options))), len(question.options)) if question.options else []
             shuffled_options = [question.options[index] for index in student.shuffled_options]
-            sent_message = self.api.send_message(student.chat_id, text, reply_markup=self._build_keyboard(shuffled_options, question_type=question.type, selected_indexes=None))
+            if compact_mode:
+                compact_options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
+                opts_lines = "\n".join(
+                    f"{i + 1}) {re.sub(compact_options_pattern, '', str(opt)).strip()}"
+                    for i, opt in enumerate(shuffled_options)
+                )
+                text += f"\n\nВаріанти:\n{opts_lines}"
+            sent_message = self.api.send_message(
+                student.chat_id,
+                text,
+                reply_markup=self._build_keyboard(
+                    shuffled_options,
+                    question_type=question.type,
+                    selected_indexes=None,
+                    compact_mode=compact_mode,
+                ),
+            )
+
         if isinstance(sent_message, dict) and "message_id" in sent_message:
             student.current_question_message_id = sent_message["message_id"]
             self._persist_students()
+
+        # Render "below" images for single/multi (matching already returns earlier).
+        if photo_position != "top" and photo_path:
+            try:
+                self.api.send_photo(student.chat_id, str(photo_path), caption=photo_caption)
+            except Exception:
+                pass
 
     def _check_answer(self, question: Question, answer_indexes: Set[int]) -> bool:
         return set(question.answer) == answer_indexes
@@ -3186,25 +3662,54 @@ class QuizBot:
                 elif student.delete_action_mode == "purge_topic" and mode == "purge_topic" and student.delete_action_source == target_id:
                     resolved_topic_id = self._resolve_topic_id(target_id)
                     topic = self._topic_by_id(resolved_topic_id) if resolved_topic_id else None
+
                     if topic:
-                        self.questions = [question for question in self.questions if question.topic_id != resolved_topic_id]
-                        self.questions_store.save([{"id": q.id, "topic_id": q.topic_id, "type": q.type, "question": q.question, "options": q.options, "answer": q.answer, "explanation": q.explanation} for q in self.questions])
+                        self.questions = [
+                            question for question in self.questions if question.topic_id != resolved_topic_id
+                        ]
+                        self.questions_store.save(
+                            [
+                                {
+                                    "id": q.id,
+                                    "topic_id": q.topic_id,
+                                    "type": q.type,
+                                    "question": q.question,
+                                    "options": q.options,
+                                    "answer": q.answer,
+                                    "explanation": q.explanation,
+                                    "image": q.image,
+                                }
+                                for q in self.questions
+                            ]
+                        )
+
                         deleted = self._delete_topic(resolved_topic_id)
                         if deleted:
                             self.api.send_message(chat_id, "Тему та всі питання в ній видалено.")
                             self._show_admin_topics_menu(chat_id)
                         self.api.answer_callback_query(callback_query["id"], "Видалено" if deleted else "Не знайдено")
-                student.awaiting_delete_action = False
-                student.delete_action_mode = None
-                student.delete_action_source = None
-                self._persist_students()
-                return
+
+                    student.awaiting_delete_action = False
+                    student.delete_action_mode = None
+                    student.delete_action_source = None
+                    self._persist_students()
+                    return
 
         if data == "main_menu":
+            # Leaving any import-related UI: clear stale DOCX import flags.
+            student.awaiting_docx_import = False
+            student.awaiting_docx_topic_id = None
+            self._persist_students()
+
             self._show_main_menu(chat_id, user["id"])
             self.api.answer_callback_query(callback_query["id"], "Відкрито меню")
             return
         if data == "back_to_topics":
+            # Leaving any import-related UI: clear stale DOCX import flags.
+            student.awaiting_docx_import = False
+            student.awaiting_docx_topic_id = None
+            self._persist_students()
+
             self.api.send_message(chat_id, "Оберіть тему:", reply_markup=self._build_topics_keyboard())
             self.api.answer_callback_query(callback_query["id"], "Відкрито список тем")
             return
@@ -3312,7 +3817,13 @@ class QuizBot:
                 return
             target_id = data.split(":", 2)[2]
             target_student = self.students.get(target_id)
-            if target_student:
+            if target_student and target_student.status != "deleted":
+                # Ensure the student is actually pending approval — don't approve
+                # a student who was rejected and then re-created by /start without
+                # re-entering their name (issue: tombstone is cleared early in _handle_start).
+                if target_student.status != "pending_approval":
+                    self.api.answer_callback_query(callback_query["id"], "Учень не очікує схвалення")
+                    return
                 target_student.status = "approved"
                 self._persist_students()
                 self._show_student_details(chat_id, target_student)
@@ -3332,7 +3843,9 @@ class QuizBot:
                 self._notify_admins(
                     f"✅ Учня схвалено: {target_student.full_name or f'Учень {target_student.user_id}'} (ID: {target_student.user_id})"
                 )
-            self.api.answer_callback_query(callback_query["id"], "Учня схвалено")
+                self.api.answer_callback_query(callback_query["id"], "Учня схвалено")
+            else:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
             return
         if data.startswith("student:block:"):
             if user["id"] not in self.admin_user_ids:
@@ -3364,6 +3877,89 @@ class QuizBot:
             self._persist_students()
             self._show_student_details(chat_id, target_student)
             self.api.answer_callback_query(callback_query["id"], "Учня заблоковано")
+            return
+        if data.startswith("student:reject:"):
+            if user["id"] not in self.admin_user_ids:
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+
+            target_id_raw = data.split(":", 2)[2]
+            try:
+                target_id_int = int(target_id_raw)
+                target_id = str(target_id_int)
+            except (TypeError, ValueError):
+                target_id_int = None
+                target_id = target_id_raw
+
+            target_student = self.students.get(target_id)
+            if not target_student:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+                return
+
+            if target_id in self.students:
+                del self.students[target_id]
+            if target_id_int is not None:
+                self.sessions_store.delete_student(target_id_int)
+                self.results_store.delete_student_history(target_id_int)
+            self.deleted_student_keys.add(target_id)
+            self._persist_state()
+            self._persist_students()
+
+            self.api.edit_message_text(
+                chat_id=chat_id,
+                message_id=message["message_id"],
+                text=f"🚫 Запит від учня {target_student.full_name or target_id} відхилено і видалено.",
+                reply_markup={"inline_keyboard": []}
+            )
+            self.api.answer_callback_query(callback_query["id"], "Запит відхилено")
+            
+            if getattr(target_student, "chat_id", None) is not None:
+                try:
+                    self.api.send_message(
+                        target_student.chat_id,
+                        "Твій запит було відхилено адміністратором."
+                    )
+                except RuntimeError as exc:
+                    print(f"[student reject notify] failed chat_id={target_student.chat_id}: {exc}")
+            
+            self._notify_admins(
+                f"🚫 Запит учня відхилено: {target_student.full_name or f'Учень {target_student.user_id}'} (ID: {target_student.user_id})"
+            )
+            return
+        if data.startswith("student:unblock:"):
+            if user["id"] not in self.admin_user_ids:
+                self.api.answer_callback_query(callback_query["id"], "Немає прав")
+                return
+
+            target_id_raw = data.split(":", 2)[2]
+            try:
+                target_id_int = int(target_id_raw)
+                target_id = str(target_id_int)
+            except (TypeError, ValueError):
+                target_id_int = None
+                target_id = target_id_raw
+
+            target_student = self.students.get(target_id)
+            if not target_student:
+                self.api.answer_callback_query(callback_query["id"], "Учня не знайдено")
+                return
+
+            target_student.status = "approved"
+            self._persist_students()
+            self._show_student_details(chat_id, target_student)
+
+            # notify student
+            if getattr(target_student, "chat_id", None) is not None:
+                try:
+                    self.api.send_message(
+                        target_student.chat_id,
+                        "Твій акаунт розблоковано. Доступ відкрито.",
+                        reply_markup=self._build_back_to_main_keyboard(),
+                    )
+                except RuntimeError as exc:
+                    print(f"[student unblock notify] failed chat_id={target_student.chat_id}: {exc}")
+
+            self.api.answer_callback_query(callback_query["id"], "Учня розблоковано")
             return
         if data.startswith("student:delete:"):
             if user["id"] not in self.admin_user_ids:
@@ -3449,6 +4045,14 @@ class QuizBot:
                 self.api.answer_callback_query(callback_query["id"], "Питання не знайдено")
                 return
 
+            compact_mode = self._compact_mode_for_question(question)
+
+            timer_line = ""
+            if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
+                elapsed = int(time.time() - float(student.current_test_started_at))
+                remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
+                timer_line = f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+
             raw = data.split(":", 1)[1]
             if question.type == "matching":
                 left_count = len(question.options) // 2 if len(question.options) // 2 else len(question.options)
@@ -3456,8 +4060,20 @@ class QuizBot:
                     self.api.answer_callback_query(callback_query["id"], "Усі пари вже зіставлено. Використай «Підтвердити вибір» або «Скинути».")
                     return
             if question.type == "matching":
+                half = len(question.options) // 2
+                left_count = half if half else len(question.options)
+                right_count = len(question.options) - left_count
+                left_map = student.shuffled_matching_left if student.shuffled_matching_left else list(range(left_count))
+                right_map = student.shuffled_matching_right if student.shuffled_matching_right else list(range(right_count))
+                left_options = question.options[:half] if half else question.options
+                right_options = question.options[half:] if half else []
+                shuffled_left_options = [left_options[i] for i in left_map if 0 <= i < len(left_options)]
+                shuffled_right_options = [right_options[i] for i in right_map if 0 <= i < len(right_options)]
+
                 if raw == "submit":
-                    pairs = [(left + 1, right + 1) for left, right in sorted(student.matching_pairs.items())]
+                    # Convert shuffled indices back to original indices for grading
+                    # left_map[callback_idx] = original_index for left, right_map similarly for right
+                    pairs = [(left_map[left] + 1, right_map[right] + 1) for left, right in sorted(student.matching_pairs.items())]
                     self._grade_matching_question(student, pairs)
                     student.matching_pairs = {}
                     student.matching_selected_left = None
@@ -3466,18 +4082,27 @@ class QuizBot:
                     return
 
                 if raw == "reset":
+                    if compact_mode and not student.matching_pairs and student.matching_selected_left is None:
+                        self.api.answer_callback_query(callback_query["id"], "")
+                        return
                     student.matching_pairs = {}
                     student.matching_selected_left = None
                     self._persist_students()
+
                     self.api.edit_message_text(
                         chat_id,
                         message["message_id"],
-                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nСтан зіставлення скинуто.",
+                        (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                              + (f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}" if compact_mode else "")
+                          + f"\n\nПари скинуто"),
                         reply_markup=self._build_keyboard(
-                            question.options,
+                            shuffled_left_options + shuffled_right_options,
                             question_type="matching",
-                            matching_pairs=student.matching_pairs,
-                            matching_selected_left=student.matching_selected_left,
+                            matching_pairs={},
+                            matching_selected_left=None,
+                            compact_mode=compact_mode,
+                            matching_left_map=left_map,
+                            matching_right_map=right_map,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], "Скинуто")
@@ -3511,35 +4136,50 @@ class QuizBot:
                     if student.matching_selected_left == index:
                         student.matching_selected_left = None
                         self._persist_students()
+                        pairs_text = ", ".join(
+                            str(left + 1) + chr(ord("a") + right)
+                            for left, right in sorted(student.matching_pairs.items())
+                        ) or "нічого"
                         self.api.edit_message_text(
                             chat_id,
                             message["message_id"],
-                            f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}",
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                              + (f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}" if compact_mode else "")
+                             + f"\n\nПари: {pairs_text}"),
                             reply_markup=self._build_keyboard(
-                                (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                                shuffled_left_options + shuffled_right_options,
                                 question_type="matching",
                                 matching_pairs=student.matching_pairs,
                                 matching_selected_left=student.matching_selected_left,
+                                compact_mode=compact_mode,
                             ),
                         )
                         self.api.answer_callback_query(callback_query["id"], "Знято вибір")
                         return
 
-                    student.matching_selected_left = index
-                    self._persist_students()
-                    self.api.edit_message_text(
-                        chat_id,
-                        message["message_id"],
-                        f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОберіть праву букву для {index + 1}.",
-                        reply_markup=self._build_keyboard(
-                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
-                            question_type="matching",
-                            matching_pairs=student.matching_pairs,
-                            matching_selected_left=student.matching_selected_left,
-                        ),
-                    )
-                    self.api.answer_callback_query(callback_query["id"], f"Обрано {index + 1}")
-                    return
+                    else:
+                        student.matching_selected_left = index
+                        self._persist_students()
+                        pairs_text = ", ".join(
+                            str(left + 1) + chr(ord("a") + right)
+                            for left, right in sorted(student.matching_pairs.items())
+                        ) or "нічого"
+                        self.api.edit_message_text(
+                            chat_id,
+                            message["message_id"],
+                            (f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                             + (f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}" if compact_mode else "")
+                              + f"\n\nПари: {pairs_text}"),
+                            reply_markup=self._build_keyboard(
+                                shuffled_left_options + shuffled_right_options,
+                                question_type="matching",
+                                matching_pairs=student.matching_pairs,
+                                matching_selected_left=student.matching_selected_left,
+                                compact_mode=compact_mode,
+                            ),
+                        )
+                        self.api.answer_callback_query(callback_query["id"], "Знято вибір")
+                        return
 
                 if side == "right":
                     if index < 0 or index >= right_count:
@@ -3577,21 +4217,23 @@ class QuizBot:
                         f"{left + 1}{chr(ord('a') + right)}"
                         for left, right in sorted(student.matching_pairs.items())
                     ) or "нічого"
-                    question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nПари: {pairs_text}"
+                    question_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\nНатискай спочатку лівий номер, потім праву букву.{timer_line}"
+                    if compact_mode:
+                        question_text += f"\n\n{self._render_compact_options_text(question, matching_left_map=left_map, matching_right_map=right_map)}"
                     if all_paired:
                         question_text += "\n\n✅ Усі пари відмічено. Тепер доступне лише підтвердження або скидання."
+                    question_text += f"\n\nПари: {pairs_text}"
 
                     self.api.edit_message_text(
                         chat_id,
                         message["message_id"],
                         question_text,
                         reply_markup=self._build_keyboard(
-                            (question.options[:half] if half else question.options) + (question.options[half:] if half else []),
+                            shuffled_left_options + shuffled_right_options,
                             question_type="matching",
                             matching_pairs=student.matching_pairs,
                             matching_selected_left=student.matching_selected_left,
-                            matching_left_map=left_map,
-                            matching_right_map=right_map,
+                            compact_mode=compact_mode,
                         ),
                     )
                     self.api.answer_callback_query(callback_query["id"], f"Пара: {pairs_text}")
@@ -3620,10 +4262,38 @@ class QuizBot:
                 else:
                     student.pending_multi_answers.append(original_selected)
                 self._persist_students()
-                chosen_text = ", ".join(question.options[i] for i in sorted(student.pending_multi_answers) if 0 <= i < len(question.options)) or "нічого"
-                updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}\n\nОбрано: {chosen_text}"
-                self.api.edit_message_text(chat_id, message["message_id"], updated_text, reply_markup=self._build_keyboard([question.options[i] for i in student.shuffled_options], question_type="multi", selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options}))
-                self.api.answer_callback_query(callback_query["id"], f"Обрано: {chosen_text}")
+                # Keep selection visible via highlighted buttons/checkboxes, not by re-rendering the selected text.
+                compact_mode = self._compact_mode_for_question(question)
+                shuffled_options = [question.options[i] for i in student.shuffled_options]
+
+                updated_text = f"Питання {student.current_index + 1}/{len(student.current_test)}\n\n{question.question}"
+
+                # Preserve timer line on every answer click.
+                if student.current_test_started_at is not None and student.current_test_duration_seconds is not None:
+                    elapsed = int(time.time() - float(student.current_test_started_at))
+                    remaining = max(0, int(student.current_test_duration_seconds) - elapsed)
+                    updated_text += f"\n⏳ Залишилось часу: {remaining // 60} хв {remaining % 60} с"
+
+                if compact_mode:
+                    compact_options_pattern = r'^[\s\.\:\-\u2013\u2014\u2022•]+\s*'
+                    opts_lines = "\n".join(
+                        f"{i + 1}) {re.sub(compact_options_pattern, '', str(opt)).strip()}"
+                        for i, opt in enumerate(shuffled_options)
+                    )
+                    updated_text += f"\n\nВаріанти:\n{opts_lines}"
+
+                self.api.edit_message_text(
+                    chat_id,
+                    message["message_id"],
+                    updated_text,
+                    reply_markup=self._build_keyboard(
+                        shuffled_options,
+                        question_type="multi",
+                        selected_indexes={student.shuffled_options.index(i) for i in student.pending_multi_answers if i in student.shuffled_options},
+                        compact_mode=compact_mode,
+                    ),
+                )
+                self.api.answer_callback_query(callback_query["id"], "Вибір збережено")
                 return
             original_selected = student.shuffled_options[selected] if 0 <= selected < len(student.shuffled_options) else selected
             self._grade_question(student, {original_selected})
